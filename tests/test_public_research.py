@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import concurrent.futures
+import json
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -11,12 +17,19 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import ashare_quant.public_research as public_module
 from ashare_quant.public_research import (
+    MiniRacer,
+    PublicDownloadConfig,
     PublicStrategyConfig,
+    _SinaDecoder,
+    _SinaPayload,
     _build_features,
+    _build_sina_bars,
     _calculate_metrics,
     _eastmoney_secid,
     _rebalance_public_positions,
+    download_public_history,
     load_membership,
     members_at,
     seal_public_cache,
@@ -25,6 +38,230 @@ from ashare_quant.public_research import (
 
 
 class PublicResearchTests(unittest.TestCase):
+    def test_sina_decoder_uses_one_runtime_on_its_owner_thread(self) -> None:
+        events: dict[str, object] = {"created": 0, "calls": []}
+
+        class FakeRuntime:
+            def __enter__(self) -> FakeRuntime:
+                events["entered_thread"] = threading.get_ident()
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                events["exited_thread"] = threading.get_ident()
+
+            def eval(self, script: str) -> None:
+                self.assert_owner()
+                events["script"] = script
+
+            def call(self, function: str, encoded: str) -> object:
+                self.assert_owner()
+                self_calls = events["calls"]
+                assert isinstance(self_calls, list)
+                self_calls.append(threading.get_ident())
+                if encoded == "bad":
+                    raise ValueError("bad payload")
+                return json.loads(encoded)
+
+            def assert_owner(self) -> None:
+                self.asserted_owner = events["owner_thread"]
+                if threading.get_ident() != self.asserted_owner:
+                    raise AssertionError("runtime used outside decoder thread")
+
+        def factory() -> FakeRuntime:
+            events["created"] = int(events["created"]) + 1
+            events["owner_thread"] = threading.get_ident()
+            return FakeRuntime()
+
+        with _SinaDecoder(
+            queue_size=3,
+            runtime_factory=factory,
+            decode_script="function d(value) { return JSON.parse(value); }",
+        ) as decoder:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                decoded = list(
+                    executor.map(
+                        decoder.decode,
+                        [json.dumps({"value": value}) for value in range(60)],
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "bad payload"):
+                decoder.decode("bad")
+            self.assertEqual(decoder.decode('{"value": 61}'), {"value": 61})
+
+        self.assertEqual(events["created"], 1)
+        self.assertEqual([item["value"] for item in decoded], list(range(60)))
+        self.assertEqual(events["entered_thread"], events["owner_thread"])
+        self.assertEqual(events["exited_thread"], events["owner_thread"])
+        self.assertEqual(set(events["calls"]), {events["owner_thread"]})
+
+    def test_sina_decoder_calls_close_for_legacy_compatible_runtime(self) -> None:
+        events: dict[str, object] = {}
+
+        class ClosableRuntime:
+            def eval(self, script: str) -> None:
+                events["owner_thread"] = threading.get_ident()
+
+            def call(self, function: str, encoded: str) -> object:
+                self.assert_owner()
+                return encoded
+
+            def close(self) -> None:
+                self.assert_owner()
+                events["closed"] = True
+
+            def assert_owner(self) -> None:
+                if threading.get_ident() != events["owner_thread"]:
+                    raise AssertionError("lifecycle left decoder thread")
+
+        with _SinaDecoder(
+            queue_size=1,
+            runtime_factory=ClosableRuntime,
+            decode_script="function d(value) { return value; }",
+        ) as decoder:
+            self.assertEqual(decoder.decode("ok"), "ok")
+        self.assertTrue(events["closed"])
+
+    def test_sina_payload_transform_preserves_hfq_semantics(self) -> None:
+        payload = _SinaPayload(
+            symbol="SH600000",
+            start_date="2020-01-01",
+            end_date="2020-01-31",
+            encoded_history="unused",
+            factor_payload={"data": [{"d": "2020-01-01", "f": "2.0"}]},
+        )
+        decoded = [
+            {
+                "date": "2020-01-02",
+                "open": "10",
+                "close": "11",
+                "high": "12",
+                "low": "9",
+                "volume": "1000",
+                "amount": "10000",
+            },
+            {
+                "date": "2020-01-03",
+                "open": "11",
+                "close": "12",
+                "high": "13",
+                "low": "10",
+                "volume": "1100",
+                "amount": "12000",
+            },
+        ]
+        frame = _build_sina_bars(payload, decoded)
+        self.assertEqual(frame["symbol"].unique().tolist(), ["SH600000"])
+        self.assertEqual(frame["close"].tolist(), [22.0, 24.0])
+        self.assertEqual(frame["open"].tolist(), [20.0, 22.0])
+        self.assertTrue(pd.isna(frame["pct_change"].iloc[0]))
+        self.assertAlmostEqual(float(frame["pct_change"].iloc[1]), 100 / 11)
+
+    @unittest.skipIf(MiniRacer is None, "需要可选 MiniRacer 运行时")
+    def test_sina_download_six_workers_share_one_actual_runtime(self) -> None:
+        original_runtime = MiniRacer
+        assert original_runtime is not None
+        runtime_creations: list[int] = []
+        request_threads: set[int] = set()
+        request_lock = threading.Lock()
+
+        class FakeResponse:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_get(url: str, **kwargs: object) -> FakeResponse:
+            del kwargs
+            with request_lock:
+                request_threads.add(threading.get_ident())
+            time.sleep(0.01)
+            if url.endswith("/hfq.js"):
+                return FakeResponse(
+                    "var hfq={'data':[{'d':'2020-01-01','f':'1.0'}]}\n"
+                )
+            return FakeResponse('var history="token";')
+
+        def runtime_factory() -> object:
+            runtime_creations.append(threading.get_ident())
+            return original_runtime()
+
+        decode_script = """
+        function d(value) {
+          return [
+            {date: '2020-01-02', open: 10, close: 11, high: 12, low: 9, volume: 1000, amount: 10000},
+            {date: '2020-01-03', open: 11, close: 12, high: 13, low: 10, volume: 1100, amount: 12000},
+            {date: '2020-01-06', open: 12, close: 13, high: 14, low: 11, volume: 1200, amount: 14000}
+          ];
+        }
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            membership = root / "membership.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": f"SH60000{number}",
+                        "name": f"测试{number}",
+                        "opt-in": "2020-01-01",
+                        "opt-out": "",
+                    }
+                    for number in range(6)
+                ]
+            ).to_csv(membership, index=False)
+            with (
+                mock.patch.object(public_module.requests, "get", side_effect=fake_get),
+                mock.patch.object(public_module, "MiniRacer", side_effect=runtime_factory),
+                mock.patch.object(public_module, "hk_js_decode", decode_script),
+            ):
+                manifest = download_public_history(
+                    membership,
+                    root / "cache",
+                    PublicDownloadConfig(
+                        start_date="2020-01-01",
+                        end_date="2020-01-31",
+                        workers=6,
+                        retries=1,
+                        request_pause_seconds=0.0,
+                    ),
+                )
+
+        self.assertEqual(len(runtime_creations), 1)
+        self.assertGreaterEqual(len(request_threads), 2)
+        self.assertNotIn(runtime_creations[0], request_threads)
+        self.assertEqual(manifest["available_count"], 8)
+        self.assertEqual(
+            manifest["decoder_architecture"],
+            "single_dedicated_thread_bounded_queue",
+        )
+
+    @unittest.skipIf(MiniRacer is None, "需要可选 MiniRacer 运行时")
+    def test_mini_racer_subprocess_stress(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tests" / "stress_sina_decoder.py"),
+                "--workers",
+                "6",
+                "--tasks",
+                "120",
+                "--repeats",
+                "2",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
+        )
+        summary = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(summary["workers"], 6)
+        self.assertEqual(summary["decoded"], 240)
+
     def test_membership_uses_exclusive_opt_out(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "membership.csv"

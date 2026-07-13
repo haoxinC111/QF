@@ -4,13 +4,15 @@ import concurrent.futures
 import json
 import logging
 import math
+import queue
 import random
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
@@ -64,10 +66,6 @@ except ImportError:  # pragma: no cover - optional dependency
     except ImportError:
         MiniRacer = None  # type: ignore[misc,assignment]
 
-_MINIRACER_THREAD_LOCAL: threading.local = threading.local()
-_MINIRACER_INIT_LOCK: threading.Lock = threading.Lock()
-
-
 @dataclass(frozen=True)
 class PublicDownloadConfig:
     start_date: str = "2012-01-01"
@@ -77,6 +75,21 @@ class PublicDownloadConfig:
     retries: int = 7
     timeout_seconds: float = 30.0
     request_pause_seconds: float = 0.15
+
+
+@dataclass(frozen=True)
+class _SinaPayload:
+    symbol: str
+    start_date: str
+    end_date: str
+    encoded_history: str
+    factor_payload: dict[str, object] | None
+
+
+@dataclass(frozen=True)
+class _SinaDecodeTask:
+    encoded_history: str
+    future: concurrent.futures.Future[object]
 
 
 @dataclass(frozen=True)
@@ -259,29 +272,175 @@ def _request_bars(
     raise RuntimeError(f"下载 {symbol} 失败，已重试 {retries} 次: {last_error}")
 
 
-def _get_sina_js_runtime() -> object:
-    """Return a thread-local MiniRacer runtime with the Sina decode function loaded.
+class _SinaDecoder:
+    """Own exactly one MiniRacer runtime on one dedicated decoder thread."""
 
-    MiniRacer/V8 does not tolerate concurrent initialization across threads, so the
-    first creation in each thread is serialized with a process-wide lock. The runtime
-    is then reused for every subsequent call on that thread.
-    """
-    if hk_js_decode is None or MiniRacer is None:
-        raise RuntimeError(
-            "新浪公开源需要可选依赖，请先运行 pip install 'akshare>=1.18,<2'"
+    _STOP = object()
+
+    def __init__(
+        self,
+        *,
+        queue_size: int = 16,
+        operation_timeout_seconds: float = 120.0,
+        runtime_factory: Callable[[], object] | None = None,
+        decode_script: str | None = None,
+    ) -> None:
+        if queue_size < 1 or operation_timeout_seconds <= 0:
+            raise ValueError("解码队列容量和超时必须为正数")
+        if runtime_factory is None:
+            if MiniRacer is None:
+                raise RuntimeError(
+                    "新浪公开源需要可选依赖，请先运行 pip install 'akshare>=1.18,<2'"
+                )
+            runtime_factory = MiniRacer
+        if decode_script is None:
+            if hk_js_decode is None:
+                raise RuntimeError(
+                    "新浪公开源需要 akshare.stock.cons.hk_js_decode"
+                )
+            decode_script = hk_js_decode
+        self._runtime_factory = runtime_factory
+        self._decode_script = decode_script
+        self._operation_timeout_seconds = operation_timeout_seconds
+        self._queue: queue.Queue[_SinaDecodeTask | object] = queue.Queue(
+            maxsize=queue_size
         )
-    runtime = getattr(_MINIRACER_THREAD_LOCAL, "runtime", None)
-    if runtime is None:
-        with _MINIRACER_INIT_LOCK:
-            runtime = getattr(_MINIRACER_THREAD_LOCAL, "runtime", None)
-            if runtime is None:
-                runtime = MiniRacer()
-                runtime.eval(hk_js_decode)
-                _MINIRACER_THREAD_LOCAL.runtime = runtime
-    return runtime
+        self._ready: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="sina-mini-racer-decoder",
+            daemon=True,
+        )
+        self._state_lock = threading.Lock()
+        self._enqueue_lock = threading.Lock()
+        self._started = False
+        self._closed = False
+        self._fatal_error: BaseException | None = None
+
+    def __enter__(self) -> _SinaDecoder:
+        self.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object | None,
+    ) -> bool:
+        self.close(suppress_error=exc_type is not None)
+        return False
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("新浪解码器已经关闭")
+            if not self._started:
+                self._started = True
+                self._thread.start()
+        try:
+            self._ready.result(timeout=self._operation_timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            raise RuntimeError("新浪解码器启动超时") from exc
+
+    def decode(self, encoded_history: str) -> object:
+        if not encoded_history:
+            raise ValueError("新浪压缩行情不能为空")
+        self.start()
+        future: concurrent.futures.Future[object] = concurrent.futures.Future()
+        task = _SinaDecodeTask(encoded_history=encoded_history, future=future)
+        with self._enqueue_lock:
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeError("新浪解码器已经关闭")
+                fatal_error = self._fatal_error
+                if fatal_error is not None:
+                    raise RuntimeError("新浪解码线程已经异常退出") from fatal_error
+            try:
+                # Serialize this enqueue with close() marking the decoder closed so
+                # the stop sentinel can never overtake an accepted task.
+                self._queue.put(task, timeout=self._operation_timeout_seconds)
+            except queue.Full as exc:
+                raise RuntimeError("新浪解码队列写入超时") from exc
+        try:
+            return future.result(timeout=self._operation_timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            raise RuntimeError("新浪 JavaScript 解码超时") from exc
+
+    def close(self, *, suppress_error: bool = False) -> None:
+        with self._enqueue_lock:
+            with self._state_lock:
+                if self._closed:
+                    return
+                self._closed = True
+                started = self._started
+            if not started:
+                return
+            try:
+                self._queue.put(self._STOP, timeout=self._operation_timeout_seconds)
+            except queue.Full:
+                if not suppress_error:
+                    raise RuntimeError("新浪解码器关闭时队列阻塞")
+                return
+        self._thread.join(timeout=self._operation_timeout_seconds)
+        if self._thread.is_alive():
+            if not suppress_error:
+                raise RuntimeError("新浪解码线程未能在超时内退出")
+            return
+        if self._fatal_error is not None and not suppress_error:
+            raise RuntimeError("新浪解码线程异常退出") from self._fatal_error
+
+    def _run(self) -> None:
+        try:
+            with ExitStack() as stack:
+                candidate = self._runtime_factory()
+                if callable(getattr(candidate, "__enter__", None)) and callable(
+                    getattr(candidate, "__exit__", None)
+                ):
+                    runtime = stack.enter_context(candidate)  # type: ignore[arg-type]
+                else:
+                    runtime = candidate
+                    close = getattr(candidate, "close", None)
+                    if callable(close):
+                        stack.callback(close)
+                runtime.eval(self._decode_script)  # type: ignore[attr-defined]
+                self._ready.set_result(None)
+                while True:
+                    item = self._queue.get()
+                    if item is self._STOP:
+                        break
+                    task = item
+                    try:
+                        decoded = runtime.call(  # type: ignore[attr-defined]
+                            "d", task.encoded_history
+                        )
+                    except Exception as exc:  # isolate one malformed payload
+                        task.future.set_exception(exc)
+                    else:
+                        task.future.set_result(decoded)
+        except BaseException as exc:
+            with self._state_lock:
+                self._fatal_error = exc
+            if not self._ready.done():
+                self._ready.set_exception(exc)
+            self._fail_pending(exc)
+        finally:
+            if not self._ready.done():
+                error = RuntimeError("新浪解码线程在初始化前退出")
+                self._ready.set_exception(error)
+                with self._state_lock:
+                    self._fatal_error = error
+
+    def _fail_pending(self, error: BaseException) -> None:
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if item is not self._STOP and not item.future.done():
+                item.future.set_exception(error)
 
 
-def _request_sina_bars(
+def _request_sina_payload(
     symbol: str,
     start_date: str,
     end_date: str,
@@ -289,8 +448,8 @@ def _request_sina_bars(
     retries: int,
     timeout: float,
     pause: float,
-) -> pd.DataFrame:
-    """Fetch the compact Sina history blob and apply its point-in-date HFQ factors."""
+) -> _SinaPayload:
+    """Fetch raw Sina history/factor payloads without touching the V8 runtime."""
     sina_symbol = symbol.lower()
     history_url = (
         "https://finance.sina.com.cn/realstock/company/"
@@ -307,67 +466,21 @@ def _request_sina_bars(
             response = requests.get(history_url, headers=headers, timeout=timeout)
             response.raise_for_status()
             encoded = response.text.split("=", maxsplit=1)[1].split(";", maxsplit=1)[0]
-            runtime = _get_sina_js_runtime()
-            decoded = runtime.call("d", encoded.replace('"', ""))
-            frame = pd.DataFrame(decoded)
-            if frame.empty:
-                raise RuntimeError(f"{symbol} 返回空行情")
-            frame["date"] = (
-                pd.to_datetime(frame["date"], errors="raise")
-                .dt.tz_localize(None)
-                .dt.normalize()
-                .astype("datetime64[ns]")
-            )
-            for column in ["open", "high", "low", "close", "volume", "amount"]:
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            frame = frame.loc[:, ["date", "open", "close", "high", "low", "volume", "amount"]]
-            frame = frame.sort_values("date").drop_duplicates("date", keep="last")
-
-            # The CSI price index has no corporate-action factor. Stocks and ETFs must
-            # have a factor so splits/dividends are included in total-return ratios.
+            factor_payload: dict[str, object] | None = None
             if symbol != PUBLIC_REGIME_SYMBOL:
                 factor_response = requests.get(factor_url, headers=headers, timeout=timeout)
                 factor_response.raise_for_status()
                 factor_text = factor_response.text.split("=", maxsplit=1)[1].split("\n", maxsplit=1)[0]
                 factor_payload = json.loads(factor_text.replace("'", '"'))
-                factor = pd.DataFrame(factor_payload.get("data", []))
-                if factor.empty:
-                    raise RuntimeError(f"{symbol} 缺少新浪后复权因子")
-                factor = factor.rename(columns={"d": "date", "f": "hfq_factor"})
-                if not {"date", "hfq_factor"}.issubset(factor.columns):
+                if not isinstance(factor_payload, dict):
                     raise RuntimeError(f"{symbol} 新浪后复权因子结构异常")
-                factor = factor.loc[:, ["date", "hfq_factor"]]
-                factor["date"] = (
-                    pd.to_datetime(factor["date"], errors="raise")
-                    .dt.normalize()
-                    .astype("datetime64[ns]")
-                )
-                factor["hfq_factor"] = pd.to_numeric(factor["hfq_factor"], errors="coerce")
-                factor = factor.sort_values("date").drop_duplicates("date", keep="last")
-                frame = pd.merge_asof(frame, factor, on="date", direction="backward")
-                if frame["hfq_factor"].isna().any():
-                    raise RuntimeError(f"{symbol} 早期行情缺少后复权因子覆盖")
-                for column in ["open", "close", "high", "low"]:
-                    frame[column] = frame[column] * frame["hfq_factor"]
-                frame = frame.drop(columns="hfq_factor")
-
-            frame = frame.loc[
-                frame["date"].between(pd.Timestamp(start_date), pd.Timestamp(end_date))
-            ].copy()
-            if frame.empty:
-                raise RuntimeError(f"{symbol} 在请求区间内没有行情")
-            frame.insert(1, "symbol", symbol)
-            frame.insert(2, "name", symbol)
-            frame["amplitude_pct"] = np.nan
-            frame["pct_change"] = frame["close"].pct_change(fill_method=None) * 100.0
-            frame["change"] = frame["close"].diff()
-            frame["turnover_pct"] = np.nan
-            frame = frame.loc[:, ["date", "symbol", "name", *BAR_COLUMNS[1:]]]
-            if frame[["open", "close", "high", "low"]].isna().any().any():
-                raise RuntimeError(f"{symbol} OHLC 含非法值")
-            if (frame[["open", "close", "high", "low"]] <= 0).any().any():
-                raise RuntimeError(f"{symbol} OHLC 含非正数")
-            return frame.reset_index(drop=True)
+            return _SinaPayload(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                encoded_history=encoded.replace('"', ""),
+                factor_payload=factor_payload,
+            )
         except (requests.RequestException, ValueError, RuntimeError, IndexError, KeyError) as exc:
             last_error = exc
             if attempt + 1 >= retries:
@@ -378,6 +491,99 @@ def _request_sina_bars(
             if pause > 0:
                 time.sleep(pause)
     raise RuntimeError(f"下载 {symbol} 失败，已重试 {retries} 次: {last_error}")
+
+
+def _build_sina_bars(payload: _SinaPayload, decoded: object) -> pd.DataFrame:
+    """Transform decoded Sina rows on the requesting worker thread."""
+    symbol = payload.symbol
+    frame = pd.DataFrame(decoded)
+    if frame.empty:
+        raise RuntimeError(f"{symbol} 返回空行情")
+    frame["date"] = (
+        pd.to_datetime(frame["date"], errors="raise")
+        .dt.tz_localize(None)
+        .dt.normalize()
+        .astype("datetime64[ns]")
+    )
+    for column in ["open", "high", "low", "close", "volume", "amount"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.loc[
+        :, ["date", "open", "close", "high", "low", "volume", "amount"]
+    ]
+    frame = frame.sort_values("date").drop_duplicates("date", keep="last")
+
+    # The CSI price index has no corporate-action factor. Stocks and ETFs must
+    # have a factor so splits/dividends are included in total-return ratios.
+    if symbol != PUBLIC_REGIME_SYMBOL:
+        factor_payload = payload.factor_payload or {}
+        factor = pd.DataFrame(factor_payload.get("data", []))
+        if factor.empty:
+            raise RuntimeError(f"{symbol} 缺少新浪后复权因子")
+        factor = factor.rename(columns={"d": "date", "f": "hfq_factor"})
+        if not {"date", "hfq_factor"}.issubset(factor.columns):
+            raise RuntimeError(f"{symbol} 新浪后复权因子结构异常")
+        factor = factor.loc[:, ["date", "hfq_factor"]]
+        factor["date"] = (
+            pd.to_datetime(factor["date"], errors="raise")
+            .dt.normalize()
+            .astype("datetime64[ns]")
+        )
+        factor["hfq_factor"] = pd.to_numeric(
+            factor["hfq_factor"], errors="coerce"
+        )
+        factor = factor.sort_values("date").drop_duplicates("date", keep="last")
+        frame = pd.merge_asof(frame, factor, on="date", direction="backward")
+        if frame["hfq_factor"].isna().any():
+            raise RuntimeError(f"{symbol} 早期行情缺少后复权因子覆盖")
+        for column in ["open", "close", "high", "low"]:
+            frame[column] = frame[column] * frame["hfq_factor"]
+        frame = frame.drop(columns="hfq_factor")
+
+    frame = frame.loc[
+        frame["date"].between(
+            pd.Timestamp(payload.start_date), pd.Timestamp(payload.end_date)
+        )
+    ].copy()
+    if frame.empty:
+        raise RuntimeError(f"{symbol} 在请求区间内没有行情")
+    frame.insert(1, "symbol", symbol)
+    frame.insert(2, "name", symbol)
+    frame["amplitude_pct"] = np.nan
+    frame["pct_change"] = frame["close"].pct_change(fill_method=None) * 100.0
+    frame["change"] = frame["close"].diff()
+    frame["turnover_pct"] = np.nan
+    frame = frame.loc[:, ["date", "symbol", "name", *BAR_COLUMNS[1:]]]
+    if frame[["open", "close", "high", "low"]].isna().any().any():
+        raise RuntimeError(f"{symbol} OHLC 含非法值")
+    if (frame[["open", "close", "high", "low"]] <= 0).any().any():
+        raise RuntimeError(f"{symbol} OHLC 含非正数")
+    return frame.reset_index(drop=True)
+
+
+def _request_sina_bars(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    *,
+    retries: int,
+    timeout: float,
+    pause: float,
+    decoder: _SinaDecoder | None = None,
+) -> pd.DataFrame:
+    payload = _request_sina_payload(
+        symbol,
+        start_date,
+        end_date,
+        retries=retries,
+        timeout=timeout,
+        pause=pause,
+    )
+    if decoder is not None:
+        return _build_sina_bars(payload, decoder.decode(payload.encoded_history))
+    with _SinaDecoder(queue_size=1) as local_decoder:
+        return _build_sina_bars(
+            payload, local_decoder.decode(payload.encoded_history)
+        )
 
 
 def _bar_path(cache_dir: Path, symbol: str) -> Path:
@@ -478,35 +684,66 @@ def download_public_history(
 
     failed: dict[str, str] = {}
     completed = 0
+    decoder: _SinaDecoder | None = None
 
     def worker(symbol: str) -> tuple[str, int]:
-        fetcher = _request_sina_bars if config.source == "sina" else _request_bars
-        frame = fetcher(
-            symbol,
-            config.start_date,
-            config.end_date,
-            retries=config.retries,
-            timeout=config.timeout_seconds,
-            pause=config.request_pause_seconds,
-        )
+        if config.source == "sina":
+            if decoder is None:
+                raise RuntimeError("新浪单线程解码器未启动")
+            frame = _request_sina_bars(
+                symbol,
+                config.start_date,
+                config.end_date,
+                retries=config.retries,
+                timeout=config.timeout_seconds,
+                pause=config.request_pause_seconds,
+                decoder=decoder,
+            )
+        else:
+            frame = _request_bars(
+                symbol,
+                config.start_date,
+                config.end_date,
+                retries=config.retries,
+                timeout=config.timeout_seconds,
+                pause=config.request_pause_seconds,
+            )
         path = _bar_path(cache_dir, symbol)
         temporary = path.with_suffix(path.suffix + ".tmp")
         frame.to_csv(temporary, index=False, compression="gzip", date_format="%Y-%m-%d")
         temporary.replace(path)
         return symbol, len(frame)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.workers) as executor:
-        futures = {executor.submit(worker, symbol): symbol for symbol in pending}
-        for future in concurrent.futures.as_completed(futures):
-            symbol = futures[future]
-            try:
-                _, rows = future.result()
-                completed += 1
-                if completed % 25 == 0 or completed == len(pending):
-                    LOGGER.info("行情下载进度: %d/%d（最近 %s, %d 行）", completed, len(pending), symbol, rows)
-            except Exception as exc:  # noqa: BLE001 - preserve per-symbol failure and continue
-                failed[symbol] = str(exc)
-                LOGGER.warning("%s", failed[symbol])
+    with ExitStack() as stack:
+        if config.source == "sina" and pending:
+            decoder = stack.enter_context(
+                _SinaDecoder(
+                    queue_size=max(4, config.workers * 2),
+                    operation_timeout_seconds=max(
+                        120.0, config.timeout_seconds * 2.0
+                    ),
+                )
+            )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=config.workers
+        ) as executor:
+            futures = {executor.submit(worker, symbol): symbol for symbol in pending}
+            for future in concurrent.futures.as_completed(futures):
+                symbol = futures[future]
+                try:
+                    _, rows = future.result()
+                    completed += 1
+                    if completed % 25 == 0 or completed == len(pending):
+                        LOGGER.info(
+                            "行情下载进度: %d/%d（最近 %s, %d 行）",
+                            completed,
+                            len(pending),
+                            symbol,
+                            rows,
+                        )
+                except Exception as exc:  # preserve per-symbol failure and continue
+                    failed[symbol] = str(exc)
+                    LOGGER.warning("%s", failed[symbol])
 
     available_symbols = [
         symbol
@@ -551,6 +788,11 @@ def download_public_history(
         "membership_source": str(Path(membership_path).resolve()),
         "created_at_utc": datetime.now(UTC).isoformat(),
         "download_config": asdict(config),
+        "decoder_architecture": (
+            "single_dedicated_thread_bounded_queue"
+            if config.source == "sina"
+            else None
+        ),
         "historical_constituent_count": len(symbols),
         "requested_count": len(requested),
         "available_count": len(available_symbols),

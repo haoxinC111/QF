@@ -21,6 +21,7 @@
   - `v1.3.0`：新增公开数据源研究通道（新浪财经/东方财富）
   - `v1.4.0`：修复公开停牌锁仓缩放，分离择时/业绩基准，加入数据与运行指纹
   - `v1.4.1`：清理旧结果产物，加入输出 SHA256、结果校验和运行模块来源
+  - `v1.4.2`：新浪下载改为并发 HTTP + 单解码线程，加入跨平台压力测试
 
 ## 3. ZIP 处理标准流程
 
@@ -128,7 +129,7 @@ python -m unittest discover tests
 
 - `uv.lock` 使用 PyPI 源生成。若本地默认 mirror 不是 PyPI（如 `UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple`），使用 `uv sync --locked --extra public --default-index https://pypi.org/simple`。不要用已弃用的 `UV_INDEX_URL` 覆盖，也不要为了同步而去掉 `--locked`。
 - v1.4.0 压缩包里的 `results/public_research/` 是旧构建产物；v1.4.1 已停止追踪整个 `results/`。本地新结果只能作为绑定完整数据指纹的参考结果，源码包和 GitHub tag 不再携带生成结果。
-- issue #1（mini-racer 并发初始化 SIGTRAP）的临时修复已合并进 v1.4：依赖已锁入 `uv.lock`，并新增缓存指纹/停牌锁仓测试。但 V8 运行时仍缺少显式 `close()`/生命周期管理和多 worker 并发初始化测试。
+- issue #1（mini-racer 并发初始化 SIGTRAP）在 v1.4.2 改为单解码线程：worker 不再初始化或调用 V8；现代运行时使用 context manager，兼容实现存在 `close()` 时显式关闭。Linux/macOS CI 运行 6-worker 子进程压力测试；若真实下载仍出现原生崩溃，再升级为独立解码子进程。
 
 ## 10. 本文件维护
 
