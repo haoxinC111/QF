@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -29,7 +29,37 @@ BAR_COLUMNS = {
     "up_limit",
     "down_limit",
     "is_st",
+    "total_mv",
+    "circ_mv",
 }
+
+ACTION_COLUMNS = [
+    "symbol",
+    "record_date",
+    "ex_date",
+    "pay_date",
+    "stock_list_date",
+    "cash_dividend",
+    "stock_dividend",
+]
+
+SECURITY_COLUMNS = [
+    "symbol",
+    "name",
+    "industry",
+    "market",
+    "list_status",
+    "list_date",
+    "delist_date",
+]
+
+INDUSTRY_COLUMNS = [
+    "symbol",
+    "industry_code",
+    "industry_name",
+    "in_date",
+    "out_date",
+]
 
 
 def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -46,17 +76,35 @@ def _atomic_json(payload: dict[str, Any], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _provider_dates(values: pd.Series) -> pd.Series:
+    """Parse provider YYYYMMDD values safely even when CSV inferred them as numbers."""
+    text = values.astype("string").str.strip().str.replace(r"\.0$", "", regex=True)
+    return pd.to_datetime(text, errors="coerce", format="mixed").dt.normalize()
+
+
 @dataclass
 class MarketDataBundle:
     bars: pd.DataFrame
     membership: pd.DataFrame
     benchmark: pd.DataFrame
     calendar: pd.DatetimeIndex
+    corporate_actions: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=ACTION_COLUMNS)
+    )
+    securities: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=SECURITY_COLUMNS)
+    )
+    industry_membership: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=INDUSTRY_COLUMNS)
+    )
 
-    def prepare(self) -> "MarketDataBundle":
+    def prepare(self, strict: bool = True) -> "MarketDataBundle":
         bars = self.bars.copy()
         membership = self.membership.copy()
         benchmark = self.benchmark.copy()
+        actions = self.corporate_actions.copy()
+        securities = self.securities.copy()
+        industries = self.industry_membership.copy()
 
         missing = BAR_COLUMNS.difference(bars.columns)
         if missing:
@@ -77,6 +125,8 @@ class MarketDataBundle:
             "adj_factor",
             "up_limit",
             "down_limit",
+            "total_mv",
+            "circ_mv",
         ]
         for column in numeric_bar_columns:
             bars[column] = pd.to_numeric(bars[column], errors="coerce")
@@ -93,6 +143,42 @@ class MarketDataBundle:
         membership["index_weight"] = pd.to_numeric(
             membership.get("index_weight", 0.0), errors="coerce"
         ).fillna(0.0)
+        if "close" not in benchmark.columns:
+            raise ValueError("benchmark 缺少 close 字段")
+        for column in ["open", "high", "low", "close", "prev_close"]:
+            if column in benchmark.columns:
+                benchmark[column] = pd.to_numeric(benchmark[column], errors="coerce")
+
+        if actions.empty:
+            actions = pd.DataFrame(columns=ACTION_COLUMNS)
+        missing_actions = set(ACTION_COLUMNS).difference(actions.columns)
+        if missing_actions:
+            raise ValueError(f"corporate_actions 缺少字段: {sorted(missing_actions)}")
+        actions["symbol"] = actions["symbol"].astype(str)
+        for column in ["record_date", "ex_date", "pay_date", "stock_list_date"]:
+            actions[column] = pd.to_datetime(actions[column], errors="coerce").dt.normalize()
+        for column in ["cash_dividend", "stock_dividend"]:
+            actions[column] = pd.to_numeric(actions[column], errors="coerce").fillna(0.0)
+
+        if securities.empty:
+            securities = pd.DataFrame(columns=SECURITY_COLUMNS)
+        missing_securities = set(SECURITY_COLUMNS).difference(securities.columns)
+        if missing_securities:
+            raise ValueError(f"securities 缺少字段: {sorted(missing_securities)}")
+        securities["symbol"] = securities["symbol"].astype(str)
+        for column in ["list_date", "delist_date"]:
+            securities[column] = _provider_dates(securities[column])
+
+        if industries.empty:
+            industries = pd.DataFrame(columns=INDUSTRY_COLUMNS)
+        missing_industries = set(INDUSTRY_COLUMNS).difference(industries.columns)
+        if missing_industries:
+            raise ValueError(f"industry_membership 缺少字段: {sorted(missing_industries)}")
+        industries["symbol"] = industries["symbol"].astype(str)
+        industries["industry_code"] = industries["industry_code"].astype(str)
+        industries["industry_name"] = industries["industry_name"].astype(str)
+        for column in ["in_date", "out_date"]:
+            industries[column] = _provider_dates(industries[column])
 
         bars = bars.sort_values(["symbol", "date"]).drop_duplicates(
             ["symbol", "date"], keep="last"
@@ -101,42 +187,185 @@ class MarketDataBundle:
             ["date", "symbol"], keep="last"
         )
         benchmark = benchmark.sort_values("date").drop_duplicates("date", keep="last")
+        actions = actions.sort_values(["ex_date", "symbol"]).drop_duplicates(
+            ["symbol", "ex_date"], keep="last"
+        )
+        securities = securities.sort_values("symbol").drop_duplicates("symbol", keep="last")
+        industries = industries.sort_values(
+            ["symbol", "in_date", "out_date", "industry_code"], na_position="last"
+        ).drop_duplicates(
+            ["symbol", "industry_code", "in_date", "out_date"], keep="last"
+        )
 
-        if (bars[["open", "close", "adj_factor"]] <= 0).any().any():
+        required_numeric = bars[numeric_bar_columns]
+        if strict and not np.isfinite(required_numeric.to_numpy(dtype=float)).all():
+            bad_columns = [column for column in numeric_bar_columns if bars[column].isna().any()]
+            raise ValueError(f"行情存在 NaN 或无穷值: {bad_columns}")
+        positive_columns = [
+            "open",
+            "high",
+            "low",
+            "close",
+            "prev_close",
+            "adj_factor",
+            "up_limit",
+            "down_limit",
+            "total_mv",
+            "circ_mv",
+        ]
+        if (bars[positive_columns] <= 0).any().any():
             raise ValueError("价格和复权因子必须为正数")
+        if strict:
+            invalid_ohlc = (
+                (bars["high"] < bars[["open", "close"]].max(axis=1) - 1e-8)
+                | (bars["low"] > bars[["open", "close"]].min(axis=1) + 1e-8)
+                | (bars["high"] < bars["low"])
+            )
+            if invalid_ohlc.any():
+                sample = bars.loc[invalid_ohlc, ["date", "symbol"]].iloc[0].to_dict()
+                raise ValueError(f"OHLC 关系非法，示例: {sample}")
+            if (bars[["volume", "amount"]] < 0).any().any():
+                raise ValueError("成交量和成交额不能为负")
+            if (bars["up_limit"] < bars["down_limit"]).any():
+                raise ValueError("涨停价不能低于跌停价")
+            if not np.isfinite(benchmark["close"].to_numpy(dtype=float)).all():
+                raise ValueError("基准收盘价存在 NaN 或无穷值")
+            if (benchmark["close"] <= 0).any():
+                raise ValueError("基准收盘价必须为正数")
+            if actions["ex_date"].isna().any():
+                raise ValueError("公司行动必须包含有效 ex_date")
+            if (actions[["cash_dividend", "stock_dividend"]] < 0).any().any():
+                raise ValueError("分红送股比例不能为负")
+            if not industries.empty:
+                if industries["in_date"].isna().any():
+                    raise ValueError("行业成员记录必须包含有效 in_date")
+                invalid_labels = (
+                    industries["industry_code"].str.strip().isin({"", "nan", "None"})
+                    | industries["industry_name"].str.strip().isin({"", "nan", "None"})
+                )
+                if invalid_labels.any():
+                    raise ValueError("行业成员记录必须包含有效行业代码和名称")
+                invalid_interval = industries["out_date"].notna() & (
+                    industries["out_date"] < industries["in_date"]
+                )
+                if invalid_interval.any():
+                    raise ValueError("行业成员记录的 out_date 不能早于 in_date")
         if bars.empty or membership.empty or benchmark.empty:
             raise ValueError("行情、成分或基准数据不能为空")
 
         calendar = pd.DatetimeIndex(pd.to_datetime(self.calendar)).normalize().unique().sort_values()
         if calendar.empty:
             calendar = pd.DatetimeIndex(benchmark["date"].unique()).sort_values()
+        if strict:
+            member_symbols = set(membership["symbol"])
+            bar_symbols = set(bars["symbol"])
+            missing_bar_symbols = sorted(member_symbols.difference(bar_symbols))
+            if missing_bar_symbols:
+                raise ValueError(
+                    "历史成分缺少行情文件: " + ", ".join(missing_bar_symbols[:10])
+                )
+            if securities.empty:
+                raise ValueError("缺少证券主表 securities，请重新下载 v3 数据缓存")
+            missing_master = sorted(member_symbols.difference(set(securities["symbol"])))
+            if missing_master:
+                raise ValueError("证券主表缺少历史成分: " + ", ".join(missing_master[:10]))
+            if industries.empty:
+                raise ValueError("缺少行业成员表 industry_membership，请重新下载 v3 数据缓存")
+            missing_industry = sorted(member_symbols.difference(set(industries["symbol"])))
+            if missing_industry:
+                raise ValueError("行业成员表缺少历史成分: " + ", ".join(missing_industry[:10]))
+            uncovered: list[str] = []
+            industry_groups = {
+                symbol: group for symbol, group in industries.groupby("symbol", sort=False)
+            }
+            for symbol, member_group in membership.groupby("symbol", sort=False):
+                dates = pd.DatetimeIndex(member_group["date"].unique())
+                covered = np.zeros(len(dates), dtype=bool)
+                for interval in industry_groups[str(symbol)].itertuples(index=False):
+                    interval_end = (
+                        pd.Timestamp.max.normalize()
+                        if pd.isna(interval.out_date)
+                        else pd.Timestamp(interval.out_date)
+                    )
+                    covered |= (dates >= pd.Timestamp(interval.in_date)) & (
+                        dates <= interval_end
+                    )
+                if not covered.all():
+                    first_gap = dates[np.flatnonzero(~covered)[0]]
+                    uncovered.append(f"{symbol}@{first_gap.date()}")
+            if uncovered:
+                raise ValueError(
+                    "行业成员区间未覆盖历史指数成分快照: "
+                    + ", ".join(uncovered[:10])
+                )
+            snapshot_sizes = membership.groupby("date")["symbol"].nunique()
+            if (snapshot_sizes < 2).any():
+                raise ValueError("指数成分快照数量异常")
+            if not set(benchmark["date"]).issubset(set(calendar)):
+                raise ValueError("基准行情包含交易日历之外的日期")
+            expected_benchmark_dates = set(
+                calendar[(calendar >= benchmark["date"].min()) & (calendar <= benchmark["date"].max())]
+            )
+            missing_benchmark_dates = sorted(expected_benchmark_dates.difference(set(benchmark["date"])))
+            if missing_benchmark_dates:
+                raise ValueError(
+                    f"基准行情缺少 {len(missing_benchmark_dates)} 个交易日，"
+                    f"首个缺口为 {missing_benchmark_dates[0].date()}"
+                )
+            snapshot_dates = pd.DatetimeIndex(sorted(membership["date"].unique()))
+            if len(snapshot_dates) > 1 and snapshot_dates.to_series().diff().dt.days.max() > 62:
+                raise ValueError("历史指数成分快照存在超过 62 天的断档")
         return MarketDataBundle(
             bars=bars.reset_index(drop=True),
             membership=membership.reset_index(drop=True),
             benchmark=benchmark.reset_index(drop=True),
             calendar=calendar,
+            corporate_actions=actions.reset_index(drop=True),
+            securities=securities.reset_index(drop=True),
+            industry_membership=industries.reset_index(drop=True),
         )
 
     @classmethod
-    def from_cache(cls, cache_dir: str | Path) -> "MarketDataBundle":
+    def from_cache(cls, cache_dir: str | Path, strict: bool = True) -> "MarketDataBundle":
         root = Path(cache_dir)
         membership_path = root / "membership.csv.gz"
         benchmark_path = root / "benchmark.csv.gz"
+        actions_path = root / "corporate_actions.csv.gz"
+        securities_path = root / "securities.csv.gz"
+        industries_path = root / "industry_membership.csv.gz"
         bar_paths = sorted((root / "bars").glob("*.csv.gz"))
-        if not membership_path.exists() or not benchmark_path.exists() or not bar_paths:
+        if (
+            not membership_path.exists()
+            or not benchmark_path.exists()
+            or not actions_path.exists()
+            or not securities_path.exists()
+            or not industries_path.exists()
+            or not bar_paths
+        ):
             raise FileNotFoundError(
-                f"缓存不完整: {root}。请先运行 download，或运行 all 自动下载。"
+                f"v3 缓存不完整: {root}。请设置 refresh=true 后重新运行 download。"
             )
         bars = pd.concat((pd.read_csv(path) for path in bar_paths), ignore_index=True)
         membership = pd.read_csv(membership_path)
         benchmark = pd.read_csv(benchmark_path)
+        actions = pd.read_csv(actions_path)
+        securities = pd.read_csv(securities_path)
+        industries = pd.read_csv(industries_path)
         calendar_path = root / "calendar.csv.gz"
         if calendar_path.exists():
             calendar_frame = pd.read_csv(calendar_path)
             calendar = pd.DatetimeIndex(pd.to_datetime(calendar_frame["date"]))
         else:
             calendar = pd.DatetimeIndex(pd.to_datetime(benchmark["date"]))
-        return cls(bars, membership, benchmark, calendar).prepare()
+        return cls(
+            bars,
+            membership,
+            benchmark,
+            calendar,
+            actions,
+            securities,
+            industries,
+        ).prepare(strict=strict)
 
 
 class RateLimitedTushare:
@@ -198,7 +427,9 @@ class TushareDownloader:
 
         if not self.config.data.refresh and self._manifest_covers(manifest_path, warmup_start, end):
             LOGGER.info("命中完整本地缓存，跳过下载")
-            return MarketDataBundle.from_cache(self.root)
+            return MarketDataBundle.from_cache(
+                self.root, strict=self.config.data.strict_validation
+            )
 
         self.root.mkdir(parents=True, exist_ok=True)
         LOGGER.info("下载交易日历")
@@ -208,26 +439,51 @@ class TushareDownloader:
         if membership.empty:
             raise RuntimeError("未取得指数成分数据，请检查指数代码和 Tushare 权限")
         _atomic_csv(membership, self.root / "membership.csv.gz")
+        LOGGER.info("下载证券主表与退市日期")
+        securities = self._fetch_securities()
+        _atomic_csv(securities, self.root / "securities.csv.gz")
 
         symbols = sorted(membership["symbol"].unique())
+        LOGGER.info("下载历史申万行业成员区间")
+        industry_membership = self._fetch_industry_membership(symbols)
+        _atomic_csv(industry_membership, self.root / "industry_membership.csv.gz")
         bar_dir = self.root / "bars"
+        action_dir = self.root / "actions"
         bar_dir.mkdir(parents=True, exist_ok=True)
+        action_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info("需下载 %d 只历史成分股行情", len(symbols))
         for number, symbol in enumerate(symbols, start=1):
             target = bar_dir / f"{symbol.replace('.', '_')}.csv.gz"
-            if (
+            reuse_bar = (
                 target.exists()
                 and not self.config.data.refresh
                 and self._cached_bar_usable(target, symbol, warmup_start, end, membership)
-            ):
+            )
+            if reuse_bar:
                 LOGGER.info("[%d/%d] 复用 %s", number, len(symbols), symbol)
-                continue
-            LOGGER.info("[%d/%d] 下载 %s", number, len(symbols), symbol)
-            frame = self._fetch_symbol(symbol, warmup_start, end)
-            if frame.empty:
-                LOGGER.warning("%s 在请求区间没有行情", symbol)
-                continue
-            _atomic_csv(frame, target)
+            else:
+                LOGGER.info("[%d/%d] 下载 %s", number, len(symbols), symbol)
+                frame = self._fetch_symbol(symbol, warmup_start, end)
+                if frame.empty:
+                    LOGGER.warning("%s 在请求区间没有行情", symbol)
+                    continue
+                _atomic_csv(frame, target)
+            action_target = action_dir / f"{symbol.replace('.', '_')}.csv.gz"
+            actions = self._fetch_actions(symbol, warmup_start, end)
+            _atomic_csv(actions, action_target)
+
+        action_paths = sorted(action_dir.glob("*.csv.gz"))
+        action_frames = [pd.read_csv(path) for path in action_paths]
+        corporate_actions = (
+            pd.concat(action_frames, ignore_index=True)
+            if action_frames
+            else pd.DataFrame(columns=ACTION_COLUMNS)
+        )
+        if not corporate_actions.empty:
+            corporate_actions = corporate_actions.loc[
+                corporate_actions["symbol"].isin(symbols)
+            ]
+        _atomic_csv(corporate_actions, self.root / "corporate_actions.csv.gz")
 
         LOGGER.info("下载基准指数行情")
         benchmark = self._fetch_benchmark(warmup_start, end)
@@ -235,10 +491,12 @@ class TushareDownloader:
         _atomic_csv(pd.DataFrame({"date": calendar}), self.root / "calendar.csv.gz")
         _atomic_json(
             {
-                "schema_version": 1,
+                "schema_version": 3,
                 "provider": "tushare",
                 "universe_index": self.config.data.universe_index,
                 "benchmark_index": self.config.data.benchmark_index,
+                "industry_standard": self.config.data.industry_standard,
+                "industry_level": self.config.data.industry_level,
                 "requested_start": warmup_start.strftime("%Y-%m-%d"),
                 "requested_end": end.strftime("%Y-%m-%d"),
                 "created_at_utc": pd.Timestamp.utcnow().isoformat(),
@@ -246,7 +504,9 @@ class TushareDownloader:
             },
             manifest_path,
         )
-        return MarketDataBundle.from_cache(self.root)
+        return MarketDataBundle.from_cache(
+            self.root, strict=self.config.data.strict_validation
+        )
 
     @staticmethod
     def _cached_bar_usable(
@@ -257,8 +517,11 @@ class TushareDownloader:
         membership: pd.DataFrame,
     ) -> bool:
         try:
-            dates = pd.to_datetime(pd.read_csv(path, usecols=["date"])["date"])
+            cached = pd.read_csv(path, usecols=["date", "total_mv", "circ_mv"])
+            dates = pd.to_datetime(cached["date"])
             if dates.empty:
+                return False
+            if cached[["total_mv", "circ_mv"]].isna().any().any():
                 return False
             member_dates = membership.loc[membership["symbol"].eq(symbol), "date"]
             if member_dates.empty:
@@ -277,14 +540,35 @@ class TushareDownloader:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             return (
+                payload.get("schema_version") == 3
+                and
                 payload.get("provider") == "tushare"
                 and payload.get("universe_index") == self.config.data.universe_index
                 and payload.get("benchmark_index") == self.config.data.benchmark_index
+                and payload.get("industry_standard") == self.config.data.industry_standard
+                and payload.get("industry_level") == self.config.data.industry_level
                 and pd.Timestamp(payload["requested_start"]) <= start
                 and pd.Timestamp(payload["requested_end"]) >= end
             )
         except (KeyError, ValueError, json.JSONDecodeError):
             return False
+
+    def _fetch_securities(self) -> pd.DataFrame:
+        frames: list[pd.DataFrame] = []
+        fields = "ts_code,name,industry,market,list_status,list_date,delist_date"
+        for status in ["L", "D", "P"]:
+            frame = self.client.call(
+                "stock_basic", exchange="", list_status=status, fields=fields
+            )
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
+            raise RuntimeError("证券主表为空")
+        result = pd.concat(frames, ignore_index=True).rename(columns={"ts_code": "symbol"})
+        for column in SECURITY_COLUMNS:
+            if column not in result.columns:
+                result[column] = np.nan
+        return result[SECURITY_COLUMNS].drop_duplicates("symbol", keep="last")
 
     def _fetch_calendar(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DatetimeIndex:
         frame = self.client.call(
@@ -318,6 +602,68 @@ class TushareDownloader:
         result["date"] = pd.to_datetime(result["date"], format="%Y%m%d")
         return result.sort_values(["date", "symbol"]).drop_duplicates(["date", "symbol"])
 
+    def _fetch_industry_membership(self, symbols: list[str]) -> pd.DataFrame:
+        level = self.config.data.industry_level.upper()
+        level_key = level.lower()
+        classifications = self.client.call(
+            "index_classify",
+            level=level,
+            src=self.config.data.industry_standard,
+        )
+        if classifications.empty or "index_code" not in classifications.columns:
+            raise RuntimeError("申万行业分类为空，请检查 Tushare 权限")
+
+        frames: list[pd.DataFrame] = []
+        code_argument = f"{level_key}_code"
+        for code in sorted(classifications["index_code"].dropna().astype(str).unique()):
+            for is_new in ["Y", "N"]:
+                frame = self.client.call(
+                    "index_member_all", **{code_argument: code, "is_new": is_new}
+                )
+                if not frame.empty:
+                    frames.append(frame)
+        if not frames:
+            raise RuntimeError("申万行业成员数据为空，请检查 Tushare 权限")
+
+        raw = pd.concat(frames, ignore_index=True)
+        wanted = set(map(str, symbols))
+        raw = raw.loc[raw["ts_code"].astype(str).isin(wanted)].copy()
+
+        # 某些历史证券不会出现在分类批量结果中；只对缺口做按证券补查。
+        missing = sorted(wanted.difference(set(raw["ts_code"].astype(str))))
+        for symbol in missing:
+            for is_new in ["Y", "N"]:
+                frame = self.client.call(
+                    "index_member_all", ts_code=symbol, is_new=is_new
+                )
+                if not frame.empty:
+                    raw = pd.concat([raw, frame], ignore_index=True)
+
+        code_column = f"{level_key}_code"
+        name_column = f"{level_key}_name"
+        required = {"ts_code", code_column, name_column, "in_date"}
+        absent = required.difference(raw.columns)
+        if absent:
+            raise RuntimeError(f"申万行业成员接口缺少字段: {sorted(absent)}")
+        if "out_date" not in raw.columns:
+            raw["out_date"] = np.nan
+        result = raw.rename(
+            columns={
+                "ts_code": "symbol",
+                code_column: "industry_code",
+                name_column: "industry_name",
+            }
+        )
+        result = result.loc[result["symbol"].astype(str).isin(wanted), INDUSTRY_COLUMNS]
+        if result.empty:
+            raise RuntimeError("历史成分股未匹配到申万行业成员记录")
+        missing_after = sorted(wanted.difference(set(result["symbol"].astype(str))))
+        if missing_after:
+            raise RuntimeError(
+                "申万行业成员缺少历史成分: " + ", ".join(missing_after[:10])
+            )
+        return result.drop_duplicates().reset_index(drop=True)
+
     def _fetch_symbol(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         common = {
             "ts_code": symbol,
@@ -334,19 +680,36 @@ class TushareDownloader:
         factors = self.client.call(
             "adj_factor", **common, fields="ts_code,trade_date,adj_factor"
         )
+        if factors.empty:
+            raise RuntimeError(f"{symbol} 复权因子为空")
         limits = self.client.call(
             "stk_limit", **common, fields="ts_code,trade_date,up_limit,down_limit"
         )
+        daily_basic = self.client.call(
+            "daily_basic", **common, fields="ts_code,trade_date,total_mv,circ_mv"
+        )
+        if daily_basic.empty:
+            raise RuntimeError(f"{symbol} 每日市值数据为空")
         names = self.client.call(
             "namechange", ts_code=symbol, fields="ts_code,name,start_date,end_date"
         )
 
         frame = daily.merge(factors, on=["ts_code", "trade_date"], how="left")
+        if frame["adj_factor"].isna().any():
+            missing_dates = frame.loc[frame["adj_factor"].isna(), "trade_date"].astype(str).tolist()
+            raise RuntimeError(
+                f"{symbol} 缺少 {len(missing_dates)} 个交易日的复权因子，"
+                f"首个缺口为 {missing_dates[0]}"
+            )
         if not limits.empty:
             frame = frame.merge(limits, on=["ts_code", "trade_date"], how="left")
         else:
             frame["up_limit"] = np.nan
             frame["down_limit"] = np.nan
+        frame = frame.merge(daily_basic, on=["ts_code", "trade_date"], how="left")
+        if frame[["total_mv", "circ_mv"]].isna().any().any():
+            missing_count = int(frame[["total_mv", "circ_mv"]].isna().any(axis=1).sum())
+            raise RuntimeError(f"{symbol} 缺少 {missing_count} 个交易日的市值数据")
         frame = frame.rename(
             columns={
                 "ts_code": "symbol",
@@ -357,8 +720,7 @@ class TushareDownloader:
         )
         frame["date"] = pd.to_datetime(frame["date"], format="%Y%m%d")
         frame = frame.sort_values("date")
-        frame["adj_factor"] = pd.to_numeric(frame["adj_factor"], errors="coerce").ffill().bfill()
-        frame["adj_factor"] = frame["adj_factor"].fillna(1.0)
+        frame["adj_factor"] = pd.to_numeric(frame["adj_factor"], errors="raise")
         frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0) * 100.0
         frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce").fillna(0.0) * 1000.0
         frame["name"] = self._historical_names(frame["date"], names)
@@ -391,8 +753,43 @@ class TushareDownloader:
                 "up_limit",
                 "down_limit",
                 "is_st",
+                "total_mv",
+                "circ_mv",
             ]
         ].reset_index(drop=True)
+
+    def _fetch_actions(
+        self, symbol: str, start: pd.Timestamp, end: pd.Timestamp
+    ) -> pd.DataFrame:
+        fields = (
+            "ts_code,div_proc,record_date,ex_date,pay_date,div_listdate,"
+            "cash_div,stk_div,imp_ann_date"
+        )
+        frame = self.client.call("dividend", ts_code=symbol, fields=fields)
+        if frame.empty:
+            return pd.DataFrame(columns=ACTION_COLUMNS)
+        frame = frame.loc[frame["div_proc"].astype(str).eq("实施")].copy()
+        frame["ex_date"] = pd.to_datetime(frame["ex_date"], format="%Y%m%d", errors="coerce")
+        frame = frame.loc[frame["ex_date"].between(start, end)]
+        if frame.empty:
+            return pd.DataFrame(columns=ACTION_COLUMNS)
+        frame = frame.rename(
+            columns={
+                "ts_code": "symbol",
+                "div_listdate": "stock_list_date",
+                "cash_div": "cash_dividend",
+                "stk_div": "stock_dividend",
+            }
+        )
+        for column in ["record_date", "pay_date", "stock_list_date"]:
+            frame[column] = pd.to_datetime(
+                frame[column], format="%Y%m%d", errors="coerce"
+            )
+        for column in ["cash_dividend", "stock_dividend"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+        return frame[ACTION_COLUMNS].sort_values("ex_date").drop_duplicates(
+            ["symbol", "ex_date"], keep="last"
+        )
 
     @staticmethod
     def _historical_names(dates: pd.Series, names: pd.DataFrame) -> pd.Series:
@@ -463,6 +860,7 @@ def make_demo_bundle(
         low = np.minimum(open_price, close) * (1.0 - rng.uniform(0.0, 0.012, count))
         volume = rng.lognormal(mean=16.4, sigma=0.35, size=count)
         amount = volume * (open_price + close) / 2.0
+        total_shares = 300_000_000.0 * np.exp(2.0 * index / max(1, symbols - 1))
         frame = pd.DataFrame(
             {
                 "date": calendar,
@@ -479,6 +877,8 @@ def make_demo_bundle(
                 "up_limit": np.round(prev_close * 1.10, 2),
                 "down_limit": np.round(prev_close * 0.90, 2),
                 "is_st": False,
+                "total_mv": close * total_shares / 10_000.0,
+                "circ_mv": close * total_shares * 0.70 / 10_000.0,
             }
         )
         frames.append(frame)
@@ -503,4 +903,33 @@ def make_demo_bundle(
             "prev_close": np.r_[benchmark_close[0], benchmark_close[:-1]],
         }
     )
-    return MarketDataBundle(bars, membership, benchmark, calendar).prepare()
+    securities = pd.DataFrame(
+        {
+            "symbol": sorted(bars["symbol"].unique()),
+            "name": [f"DEMO{index:02d}" for index in range(symbols)],
+            "industry": [f"IND{index % 8}" for index in range(symbols)],
+            "market": "DEMO",
+            "list_status": "L",
+            "list_date": pd.Timestamp(start) - pd.Timedelta(days=1000),
+            "delist_date": pd.NaT,
+        }
+    )
+    actions = pd.DataFrame(columns=ACTION_COLUMNS)
+    industry_membership = pd.DataFrame(
+        {
+            "symbol": sorted(bars["symbol"].unique()),
+            "industry_code": [f"801{index % 8:03d}.SI" for index in range(symbols)],
+            "industry_name": [f"IND{index % 8}" for index in range(symbols)],
+            "in_date": pd.Timestamp(start) - pd.Timedelta(days=1000),
+            "out_date": pd.NaT,
+        }
+    )
+    return MarketDataBundle(
+        bars,
+        membership,
+        benchmark,
+        calendar,
+        actions,
+        securities,
+        industry_membership,
+    ).prepare()

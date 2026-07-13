@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import pandas as pd
+
+from .backtest import Backtester
+from .config import AppConfig
+from .data import MarketDataBundle
+from .report import calculate_metrics
+
+
+FACTOR_FIELDS = {
+    "mom_12_1": "momentum_12_1_weight",
+    "mom_6_1": "momentum_6_1_weight",
+    "trend": "trend_weight",
+    "low_vol": "low_volatility_weight",
+    "liquidity": "liquidity_weight",
+}
+
+
+def _run_metrics(bundle: MarketDataBundle, config: AppConfig) -> dict[str, object]:
+    return calculate_metrics(Backtester(bundle, config).run(), config)
+
+
+def run_factor_ablation(
+    bundle: MarketDataBundle,
+    config: AppConfig,
+    factors: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Run the full model and one leave-one-factor-out backtest per factor."""
+    requested = list(factors or FACTOR_FIELDS)
+    unknown = sorted(set(requested).difference(FACTOR_FIELDS))
+    if unknown:
+        raise ValueError("未知因子: " + ", ".join(unknown))
+
+    cases: list[tuple[str, AppConfig]] = [("full", config)]
+    for factor in requested:
+        strategy = replace(config.strategy, **{FACTOR_FIELDS[factor]: 0.0})
+        cases.append((f"without_{factor}", replace(config, strategy=strategy)))
+
+    records: list[dict[str, object]] = []
+    for variant, case_config in cases:
+        metrics = _run_metrics(bundle, case_config)
+        records.append(
+            {
+                "variant": variant,
+                "removed_factor": "" if variant == "full" else variant.removeprefix("without_"),
+                **metrics,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def run_cost_stress(
+    bundle: MarketDataBundle,
+    config: AppConfig,
+    slippage_bps: Sequence[float] = (5.0, 10.0, 20.0),
+    commission_multipliers: Sequence[float] = (1.0, 2.0),
+) -> pd.DataFrame:
+    """Stress broker commission and slippage; statutory taxes stay unchanged."""
+    slippages = sorted({float(config.execution.slippage_bps), *map(float, slippage_bps)})
+    multipliers = sorted({1.0, *map(float, commission_multipliers)})
+    if min(slippages, default=0.0) < 0 or min(multipliers, default=1.0) <= 0:
+        raise ValueError("滑点不能为负，佣金倍数必须大于 0")
+
+    records: list[dict[str, object]] = []
+    for slippage in slippages:
+        for multiplier in multipliers:
+            execution = replace(
+                config.execution,
+                slippage_bps=slippage,
+                commission_rate=config.execution.commission_rate * multiplier,
+                minimum_commission=config.execution.minimum_commission * multiplier,
+            )
+            case_config = replace(config, execution=execution)
+            metrics = _run_metrics(bundle, case_config)
+            records.append(
+                {
+                    "scenario": f"slippage_{slippage:g}bps_commission_{multiplier:g}x",
+                    "slippage_bps": slippage,
+                    "commission_multiplier": multiplier,
+                    "commission_rate": execution.commission_rate,
+                    "minimum_commission": execution.minimum_commission,
+                    **metrics,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def run_rolling_oos(
+    bundle: MarketDataBundle,
+    config: AppConfig,
+    train_years: int = 5,
+    test_years: int = 1,
+) -> pd.DataFrame:
+    """Evaluate fixed parameters in expanding, non-overlapping test windows.
+
+    The training interval is reported as a research/freeze period. This project does
+    not fit parameters automatically, so no test-window observation is used to alter
+    the strategy configuration.
+    """
+    if train_years < 1 or test_years < 1:
+        raise ValueError("train_years 和 test_years 必须至少为 1")
+    overall_start = pd.Timestamp(config.backtest.start_date)
+    overall_end = pd.Timestamp(config.backtest.end_date)
+    test_start = overall_start + pd.DateOffset(years=train_years)
+    if test_start >= overall_end:
+        raise ValueError("回测区间不足以形成滚动样本外窗口")
+
+    records: list[dict[str, object]] = []
+    window = 1
+    while test_start < overall_end:
+        test_end = min(
+            test_start + pd.DateOffset(years=test_years) - pd.Timedelta(days=1),
+            overall_end,
+        )
+        case_config = replace(
+            config,
+            backtest=replace(
+                config.backtest,
+                start_date=test_start.strftime("%Y-%m-%d"),
+                end_date=test_end.strftime("%Y-%m-%d"),
+            ),
+        )
+        metrics = _run_metrics(bundle, case_config)
+        records.append(
+            {
+                "window": window,
+                "train_start": overall_start.strftime("%Y-%m-%d"),
+                "train_end": (test_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                "test_start": test_start.strftime("%Y-%m-%d"),
+                "test_end": test_end.strftime("%Y-%m-%d"),
+                **metrics,
+            }
+        )
+        test_start = test_end + pd.Timedelta(days=1)
+        window += 1
+    return pd.DataFrame(records)
+
+
+def write_research_suite(
+    bundle: MarketDataBundle,
+    config: AppConfig,
+    output_dir: str | Path,
+    modes: Iterable[str] = ("ablation", "cost", "rolling"),
+    slippage_bps: Sequence[float] = (5.0, 10.0, 20.0),
+    commission_multipliers: Sequence[float] = (1.0, 2.0),
+    train_years: int = 5,
+    test_years: int = 1,
+) -> dict[str, Path]:
+    requested = list(dict.fromkeys(str(mode).strip().lower() for mode in modes))
+    supported = {"ablation", "cost", "rolling"}
+    unknown = sorted(set(requested).difference(supported))
+    if unknown:
+        raise ValueError("未知研究模式: " + ", ".join(unknown))
+    if not requested:
+        raise ValueError("至少选择一个研究模式")
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    written: dict[str, Path] = {}
+    if "ablation" in requested:
+        path = output / "factor_ablation.csv"
+        run_factor_ablation(bundle, config).to_csv(path, index=False)
+        written["ablation"] = path
+    if "cost" in requested:
+        path = output / "cost_stress.csv"
+        run_cost_stress(
+            bundle,
+            config,
+            slippage_bps=slippage_bps,
+            commission_multipliers=commission_multipliers,
+        ).to_csv(path, index=False)
+        written["cost"] = path
+    if "rolling" in requested:
+        path = output / "rolling_oos.csv"
+        run_rolling_oos(
+            bundle,
+            config,
+            train_years=train_years,
+            test_years=test_years,
+        ).to_csv(path, index=False)
+        written["rolling"] = path
+
+    manifest = {
+        "modes": requested,
+        "slippage_bps": list(map(float, slippage_bps)),
+        "commission_multipliers": list(map(float, commission_multipliers)),
+        "train_years": train_years,
+        "test_years": test_years,
+        "note": "滚动样本外使用冻结参数；训练窗只表示参数研究与冻结区间，不执行自动寻优。",
+        "files": {name: path.name for name, path in written.items()},
+    }
+    manifest_path = output / "research_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    written["manifest"] = manifest_path
+    return written

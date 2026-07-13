@@ -10,6 +10,7 @@ from .backtest import Backtester
 from .config import AppConfig, BacktestConfig
 from .data import MarketDataBundle, TushareDownloader, make_demo_bundle
 from .report import console_summary, write_report
+from .research import write_research_suite
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,6 +28,21 @@ def _parser() -> argparse.ArgumentParser:
     ]:
         child = subparsers.add_parser(command, help=help_text)
         child.add_argument("--config", default="config.yaml", help="YAML 配置文件")
+
+    research = subparsers.add_parser(
+        "research", help="运行因子消融、成本压力和滚动样本外评估"
+    )
+    research.add_argument("--config", default="config.yaml", help="YAML 配置文件")
+    research.add_argument(
+        "--modes",
+        default="ablation,cost,rolling",
+        help="逗号分隔：ablation,cost,rolling",
+    )
+    research.add_argument("--output", help="研究结果目录，默认在回测输出目录下")
+    research.add_argument("--slippage-bps", default="5,10,20")
+    research.add_argument("--commission-multipliers", default="1,2")
+    research.add_argument("--train-years", type=int, default=5)
+    research.add_argument("--test-years", type=int, default=1)
 
     demo = subparsers.add_parser("demo", help="无需 Token 的离线端到端演示")
     demo.add_argument("--output", default="results/demo", help="演示报告输出目录")
@@ -84,8 +100,44 @@ def _dispatch(args: argparse.Namespace) -> int:
         bundle = MarketDataBundle.from_cache(config.data.cache_dir)
         print(
             f"校验通过: {bundle.bars['symbol'].nunique()} 只股票，"
-            f"{len(bundle.bars):,} 行日线，{len(bundle.membership):,} 条成分记录"
+            f"{len(bundle.bars):,} 行日线，{len(bundle.membership):,} 条成分记录，"
+            f"{len(bundle.industry_membership):,} 条行业区间，"
+            f"{len(bundle.corporate_actions):,} 条公司行动"
         )
+        return 0
+    if args.command == "research":
+        bundle = MarketDataBundle.from_cache(
+            config.data.cache_dir, strict=config.data.strict_validation
+        )
+        output = (
+            Path(args.output).resolve()
+            if args.output
+            else Path(config.backtest.output_dir) / "research"
+        )
+        modes = [value.strip() for value in args.modes.split(",") if value.strip()]
+        slippages = [
+            float(value.strip())
+            for value in args.slippage_bps.split(",")
+            if value.strip()
+        ]
+        commission_multipliers = [
+            float(value.strip())
+            for value in args.commission_multipliers.split(",")
+            if value.strip()
+        ]
+        written = write_research_suite(
+            bundle,
+            config,
+            output,
+            modes=modes,
+            slippage_bps=slippages,
+            commission_multipliers=commission_multipliers,
+            train_years=args.train_years,
+            test_years=args.test_years,
+        )
+        print("研究完成:")
+        for name, path in written.items():
+            print(f"  {name}: {path}")
         return 0
     if args.command == "all":
         bundle = TushareDownloader(config).download()
