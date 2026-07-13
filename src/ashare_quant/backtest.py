@@ -680,7 +680,7 @@ class Backtester:
     def _next_trading_date(self, date: pd.Timestamp) -> pd.Timestamp:
         location = self.calendar_location.get(date)
         if location is None or location + 1 >= len(self.bundle.calendar):
-            return date + pd.Timedelta(days=1)
+            return date + pd.Timedelta(1, unit="D")
         return self.bundle.calendar[location + 1]
 
     def _last_bar_date(self, symbol: str, date: pd.Timestamp) -> pd.Timestamp | None:

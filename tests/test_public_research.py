@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,13 +8,19 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
 from ashare_quant.public_research import (
     PublicStrategyConfig,
     _build_features,
     _calculate_metrics,
     _eastmoney_secid,
+    _rebalance_public_positions,
     load_membership,
     members_at,
+    seal_public_cache,
+    verify_public_cache,
 )
 
 
@@ -82,6 +89,84 @@ class PublicResearchTests(unittest.TestCase):
     def test_public_config_rejects_infeasible_stock_cap(self) -> None:
         with self.assertRaises(ValueError):
             PublicStrategyConfig(top_n=10, max_stock_weight=0.05).validate()
+
+    def test_suspended_position_is_never_scaled_to_fund_buys(self) -> None:
+        config = PublicStrategyConfig()
+        outcome = _rebalance_public_positions(
+            current_positions={"LOCKED": 0.60, "OLD": 0.35},
+            requested_target={"NEW": 0.95},
+            tradable_symbols={"OLD", "NEW"},
+            nav_open=1.0,
+            when=pd.Timestamp("2024-01-02"),
+            config=config,
+        )
+        self.assertAlmostEqual(outcome.positions["LOCKED"], 0.60, places=12)
+        self.assertGreaterEqual(outcome.cash, 0.0)
+        self.assertLess(outcome.executable_scale, 1.0)
+        self.assertAlmostEqual(outcome.locked_value, 0.60, places=12)
+        self.assertAlmostEqual(
+            outcome.cash + sum(outcome.positions.values()) + outcome.cost,
+            1.0,
+            places=12,
+        )
+
+    def test_public_cache_fingerprint_detects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            membership_path = root / "csi300.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": "SH600000",
+                        "name": "测试",
+                        "opt-in": "2020-01-01",
+                        "opt-out": "",
+                    },
+                    {
+                        "symbol": "SH600001",
+                        "name": "缺失行情",
+                        "opt-in": "2020-01-01",
+                        "opt-out": "",
+                    },
+                ]
+            ).to_csv(membership_path, index=False)
+            cache = root / "cache"
+            bars = cache / "bars"
+            bars.mkdir(parents=True)
+            for symbol in ["SH600000", "SH000300", "SH510300"]:
+                (bars / f"{symbol}.csv.gz").write_bytes(f"sealed-{symbol}".encode())
+
+            manifest = seal_public_cache(membership_path, cache)
+            self.assertEqual(manifest["available_count"], 3)
+            verified = verify_public_cache(membership_path, cache)
+            self.assertTrue(verified["verification"]["verified"])
+
+            (bars / "SH600000.csv.gz").write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "完整性校验失败"):
+                verify_public_cache(membership_path, cache)
+            with self.assertRaisesRegex(ValueError, "已经封存"):
+                seal_public_cache(membership_path, cache)
+
+            (bars / "SH600000.csv.gz").write_bytes(b"sealed-SH600000")
+            (bars / "SH600001.csv.gz").write_bytes(b"new-unsealed-file")
+            with self.assertRaisesRegex(ValueError, "文件集合不一致"):
+                verify_public_cache(membership_path, cache)
+            resumable = verify_public_cache(
+                membership_path,
+                cache,
+                _allow_unsealed_files=True,
+            )
+            self.assertEqual(
+                resumable["verification"]["unsealed_paths"],
+                ["bars/SH600001.csv.gz"],
+            )
+
+    def test_public_config_requires_separate_regime_and_benchmark(self) -> None:
+        with self.assertRaisesRegex(ValueError, "必须分离"):
+            PublicStrategyConfig(
+                regime_symbol="SH000300",
+                performance_benchmark_symbol="SH000300",
+            ).validate()
 
 
 if __name__ == "__main__":

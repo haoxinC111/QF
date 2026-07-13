@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from .backtest import Backtester
@@ -15,6 +15,7 @@ from .public_research import (
     PublicDownloadConfig,
     PublicStrategyConfig,
     download_public_history,
+    verify_public_cache,
     write_public_research,
     write_public_robustness,
 )
@@ -83,6 +84,17 @@ def _parser() -> argparse.ArgumentParser:
     public_robustness.add_argument("--output", default="results/public_research/robustness")
     public_robustness.add_argument("--start", default="2013-01-01")
     public_robustness.add_argument("--end", default="2025-12-31")
+
+    public_verify = subparsers.add_parser(
+        "public-verify", help="验证公开行情缓存和历史成分文件的 SHA256 指纹"
+    )
+    public_verify.add_argument("--membership", required=True, help="csi300.csv 历史成分文件")
+    public_verify.add_argument("--cache", default="data/public_eastmoney")
+    public_verify.add_argument(
+        "--seal-legacy",
+        action="store_true",
+        help="为 v1.3 旧缓存首次生成 v1.4 指纹，不重新下载行情",
+    )
     return parser
 
 
@@ -93,9 +105,20 @@ def _load_config(path_text: str) -> AppConfig:
     return AppConfig.from_yaml(path).resolve_paths(path.parent)
 
 
-def _run_backtest(bundle: MarketDataBundle, config: AppConfig) -> None:
+def _run_backtest(
+    bundle: MarketDataBundle,
+    config: AppConfig,
+    *,
+    experiment_type: str = "strict_backtest",
+    run_context: dict[str, object] | None = None,
+) -> None:
     result = Backtester(bundle, config).run()
-    metrics = write_report(result, config)
+    metrics = write_report(
+        result,
+        config,
+        experiment_type=experiment_type,
+        run_context=run_context,
+    )
     print(console_summary(metrics))
     print(f"完整报告: {Path(config.backtest.output_dir) / 'report.html'}")
 
@@ -116,12 +139,17 @@ def _dispatch(args: argparse.Namespace) -> int:
             }
         )
         config = AppConfig(
-            data=config.data,
+            data=replace(config.data, provider="synthetic_demo"),
             backtest=BacktestConfig(**backtest_values),
             strategy=config.strategy,
             execution=config.execution,
         )
-        _run_backtest(make_demo_bundle(seed=args.seed), config)
+        _run_backtest(
+            make_demo_bundle(seed=args.seed),
+            config,
+            experiment_type="synthetic_demo",
+            run_context={"seed": args.seed, "investable_data": False},
+        )
         return 0
 
     if args.command == "public-download":
@@ -166,6 +194,20 @@ def _dispatch(args: argparse.Namespace) -> int:
             print(f"  {name}: {path}")
         return 0
 
+    if args.command == "public-verify":
+        manifest = verify_public_cache(
+            args.membership,
+            args.cache,
+            seal_legacy=args.seal_legacy,
+        )
+        verification = manifest.get("verification", {"verified": True})
+        print(
+            f"公开缓存校验通过: {manifest.get('available_count', 0)} 个文件，"
+            f"指纹 {manifest.get('data_fingerprint_sha256', '')}，"
+            f"状态 {verification.get('verified', True)}"
+        )
+        return 0
+
     config = _load_config(args.config)
     if args.command == "download":
         bundle = TushareDownloader(config).download()
@@ -175,7 +217,11 @@ def _dispatch(args: argparse.Namespace) -> int:
         )
         return 0
     if args.command == "validate-data":
-        bundle = MarketDataBundle.from_cache(config.data.cache_dir)
+        bundle = MarketDataBundle.from_cache(
+            config.data.cache_dir,
+            strict=config.data.strict_validation,
+            expected_config=config,
+        )
         print(
             f"校验通过: {bundle.bars['symbol'].nunique()} 只股票，"
             f"{len(bundle.bars):,} 行日线，{len(bundle.membership):,} 条成分记录，"
@@ -185,7 +231,9 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
     if args.command == "research":
         bundle = MarketDataBundle.from_cache(
-            config.data.cache_dir, strict=config.data.strict_validation
+            config.data.cache_dir,
+            strict=config.data.strict_validation,
+            expected_config=config,
         )
         output = (
             Path(args.output).resolve()
@@ -220,7 +268,11 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "all":
         bundle = TushareDownloader(config).download()
     else:
-        bundle = MarketDataBundle.from_cache(config.data.cache_dir)
+        bundle = MarketDataBundle.from_cache(
+            config.data.cache_dir,
+            strict=config.data.strict_validation,
+            expected_config=config,
+        )
     _run_backtest(bundle, config)
     return 0
 

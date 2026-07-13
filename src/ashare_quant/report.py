@@ -16,6 +16,11 @@ import yaml
 
 from .backtest import BacktestResult
 from .config import AppConfig
+from .provenance import (
+    build_reproducibility_manifest,
+    record_experiment,
+    write_json_atomic,
+)
 
 
 def _finite(value: float) -> float | None:
@@ -422,7 +427,13 @@ pre{{white-space:pre-wrap;background:#0f172a;color:#e2e8f0;padding:14px;border-r
 </main></body></html>"""
 
 
-def write_report(result: BacktestResult, config: AppConfig) -> dict[str, Any]:
+def write_report(
+    result: BacktestResult,
+    config: AppConfig,
+    *,
+    experiment_type: str = "strict_backtest",
+    run_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     output = Path(config.backtest.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     result.equity_curve = _with_matched_benchmark(result.equity_curve, config)
@@ -457,10 +468,35 @@ def write_report(result: BacktestResult, config: AppConfig) -> dict[str, Any]:
     (output / "runtime.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    reproducibility = build_reproducibility_manifest(
+        {
+            "app_config": config.to_dict(),
+            "run_context": dict(run_context or {}),
+        },
+        data_manifest_path=Path(config.data.cache_dir) / "manifest.json",
+    )
+    write_json_atomic(reproducibility, output / "reproducibility.json")
     image = _performance_image(result.equity_curve)
     (output / "performance.png").write_bytes(base64.b64decode(image))
     (output / "report.html").write_text(
         _html_report(result, config, metrics, image), encoding="utf-8"
+    )
+    record_experiment(
+        output / "experiment_registry.jsonl",
+        reproducibility,
+        experiment_type=experiment_type,
+        protocol={
+            "parameters": "fixed_for_this_run",
+            "untouched_holdout_certified": False,
+            "run_context": dict(run_context or {}),
+            "note": "代码记录运行身份，但是否在看过区间结果后调参必须由研究者披露。",
+        },
+        artifacts=[
+            output / "metrics.json",
+            output / "equity_curve.csv",
+            output / "reproducibility.json",
+            output / "report.html",
+        ],
     )
     return metrics
 

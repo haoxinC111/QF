@@ -17,10 +17,22 @@ import pandas as pd
 import requests
 
 from .factors import _group_capped_allocation, _winsorized_zscore
+from .provenance import (
+    build_file_inventory,
+    build_reproducibility_manifest,
+    file_fingerprint,
+    inventory_sha256,
+    record_experiment,
+    verify_file_inventory,
+    write_json_atomic,
+)
 
 
 LOGGER = logging.getLogger(__name__)
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+PUBLIC_CACHE_SCHEMA_VERSION = 1
+PUBLIC_REGIME_SYMBOL = "SH000300"
+PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL = "SH510300"
 BAR_COLUMNS = [
     "date",
     "open",
@@ -92,6 +104,8 @@ class PublicStrategyConfig:
     commission_rate: float = 0.00025
     slippage_bps: float = 5.0
     annual_cash_rate: float = 0.015
+    regime_symbol: str = PUBLIC_REGIME_SYMBOL
+    performance_benchmark_symbol: str = PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL
 
     def validate(self) -> None:
         if pd.Timestamp(self.start_date) >= pd.Timestamp(self.end_date):
@@ -104,6 +118,16 @@ class PublicStrategyConfig:
             raise ValueError("风险仓位必须满足 0 <= risk_off <= risk_on <= 1")
         if self.factor_weights.sum() <= 0:
             raise ValueError("至少需要一个正的因子权重")
+        if not self.regime_symbol or not self.performance_benchmark_symbol:
+            raise ValueError("择时指数与业绩基准代码不能为空")
+        if self.regime_symbol == self.performance_benchmark_symbol:
+            raise ValueError("公开通道的择时指数与业绩基准必须分离")
+        if (
+            self.regime_symbol != PUBLIC_REGIME_SYMBOL
+            or self.performance_benchmark_symbol
+            != PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL
+        ):
+            raise ValueError("公开下载器目前只支持沪深300价格指数与510300ETF基准")
 
     @property
     def factor_weights(self) -> pd.Series:
@@ -126,6 +150,17 @@ class PublicBacktestResult:
     selections: pd.DataFrame
     rebalances: pd.DataFrame
     data_quality: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _PublicRebalance:
+    positions: dict[str, float]
+    cash: float
+    buys: float
+    sells: float
+    cost: float
+    locked_value: float
+    executable_scale: float
 
 
 def load_membership(path: str | Path) -> pd.DataFrame:
@@ -289,7 +324,7 @@ def _request_sina_bars(
 
             # The CSI price index has no corporate-action factor. Stocks and ETFs must
             # have a factor so splits/dividends are included in total-return ratios.
-            if symbol != "SH000300":
+            if symbol != PUBLIC_REGIME_SYMBOL:
                 factor_response = requests.get(factor_url, headers=headers, timeout=timeout)
                 factor_response.raise_for_status()
                 factor_text = factor_response.text.split("=", maxsplit=1)[1].split("\n", maxsplit=1)[0]
@@ -391,11 +426,47 @@ def download_public_history(
     ]
     symbols = sorted(relevant["symbol"].unique())
     # ETF is the dividend-adjusted investable benchmark; index is the regime signal.
-    requested = symbols + ["SH000300", "SH510300"]
+    requested = symbols + [PUBLIC_REGIME_SYMBOL, PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL]
+    recorded_paths: set[str] | None = None
+    manifest_path = cache_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("公开缓存 manifest.json 不是有效 JSON") from exc
+        if (
+            existing_manifest.get("schema_version") == PUBLIC_CACHE_SCHEMA_VERSION
+            and existing_manifest.get("files")
+            and existing_manifest.get("membership_file")
+        ):
+            # Verify every previously sealed byte before a resumable download. Files
+            # left by an interrupted run are allowed here, but are forced to download
+            # again below rather than being trusted and silently added to the seal.
+            verified = verify_public_cache(
+                membership_path,
+                cache_dir,
+                _allow_unsealed_files=True,
+            )
+            recorded_paths = {
+                str(item["path"])
+                for item in verified["files"]  # type: ignore[union-attr]
+                if isinstance(item, dict) and "path" in item
+            }
     pending = [
         symbol
         for symbol in requested
-        if force or not _valid_cached_bars(_bar_path(cache_dir, symbol), config.start_date, config.end_date)
+        if force
+        or (
+            recorded_paths is not None
+            and _bar_path(cache_dir, symbol)
+            .resolve()
+            .relative_to(cache_dir)
+            .as_posix()
+            not in recorded_paths
+        )
+        or not _valid_cached_bars(
+            _bar_path(cache_dir, symbol), config.start_date, config.end_date
+        )
     ]
     LOGGER.info(
         "公开数据计划: %d 个历史成分，%d 个待下载，%d 个已缓存",
@@ -436,7 +507,40 @@ def download_public_history(
                 failed[symbol] = str(exc)
                 LOGGER.warning("%s", failed[symbol])
 
+    available_symbols = [
+        symbol
+        for symbol in requested
+        if _valid_cached_bars(
+            _bar_path(cache_dir, symbol), config.start_date, config.end_date
+        )
+    ]
+    invalid_existing = [
+        symbol
+        for symbol in requested
+        if _bar_path(cache_dir, symbol).is_file() and symbol not in available_symbols
+    ]
+    if invalid_existing:
+        raise RuntimeError(
+            "公开缓存存在未通过结构/日期校验的行情文件，拒绝写入新指纹: "
+            + ", ".join(invalid_existing[:10])
+        )
+    all_cache_symbols = sorted(
+        set(membership["symbol"].astype(str))
+        | {PUBLIC_REGIME_SYMBOL, PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL}
+    )
+    sealed_paths = [
+        _bar_path(cache_dir, symbol)
+        for symbol in all_cache_symbols
+        if _bar_path(cache_dir, symbol).is_file()
+    ]
+    files = build_file_inventory(
+        cache_dir, sealed_paths
+    )
+    membership_file = file_fingerprint(
+        membership_path, logical_path="membership.csv"
+    )
     manifest = {
+        "schema_version": PUBLIC_CACHE_SCHEMA_VERSION,
         "source": f"{config.source} public daily history via HTTPS",
         "source_url": (
             "https://finance.sina.com.cn/realstock/company/"
@@ -448,15 +552,161 @@ def download_public_history(
         "download_config": asdict(config),
         "historical_constituent_count": len(symbols),
         "requested_count": len(requested),
-        "available_count": sum(_valid_cached_bars(_bar_path(cache_dir, symbol), config.start_date, config.end_date) for symbol in requested),
+        "available_count": len(available_symbols),
+        "sealed_file_count": len(files),
         "failed": failed,
+        "regime_symbol": PUBLIC_REGIME_SYMBOL,
+        "performance_benchmark_symbol": PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL,
+        "membership_file": membership_file,
+        "files": files,
+        "data_fingerprint_sha256": inventory_sha256([membership_file, *files]),
     }
-    (cache_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    if "SH000300" in failed or "SH510300" in failed:
+    write_json_atomic(manifest, manifest_path)
+    if (
+        PUBLIC_REGIME_SYMBOL in failed
+        or PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL in failed
+    ):
         raise RuntimeError(f"基准数据下载失败: {failed}")
     return manifest
+
+
+def seal_public_cache(
+    membership_path: str | Path,
+    cache_dir: str | Path,
+) -> dict[str, object]:
+    """Create v1.4 fingerprints for a legacy public cache without redownloading."""
+    membership = load_membership(membership_path)
+    cache_dir = Path(cache_dir).resolve()
+    expected = sorted(
+        set(membership["symbol"].astype(str))
+        | {PUBLIC_REGIME_SYMBOL, PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL}
+    )
+    paths = [_bar_path(cache_dir, symbol) for symbol in expected]
+    available = [path for path in paths if path.is_file()]
+    if not available:
+        raise FileNotFoundError(f"没有找到可封存的公开行情缓存: {cache_dir}")
+    missing_benchmarks = [
+        symbol
+        for symbol in [PUBLIC_REGIME_SYMBOL, PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL]
+        if not _bar_path(cache_dir, symbol).is_file()
+    ]
+    if missing_benchmarks:
+        raise FileNotFoundError(
+            "公开缓存缺少择时/业绩基准: " + ", ".join(missing_benchmarks)
+        )
+
+    manifest_path = cache_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest: dict[str, object] = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError("公开缓存 manifest.json 不是有效 JSON") from exc
+    else:
+        manifest = {}
+    if (
+        manifest.get("schema_version") == PUBLIC_CACHE_SCHEMA_VERSION
+        and manifest.get("files")
+        and manifest.get("membership_file")
+    ):
+        raise ValueError(
+            "公开缓存已经封存；为防止把篡改后的文件重新合法化，只允许执行校验"
+        )
+    files = build_file_inventory(cache_dir, available)
+    membership_file = file_fingerprint(
+        membership_path, logical_path="membership.csv"
+    )
+    manifest.update(
+        {
+            "schema_version": PUBLIC_CACHE_SCHEMA_VERSION,
+            "sealed_at_utc": datetime.now(UTC).isoformat(),
+            "membership_source": str(Path(membership_path).resolve()),
+            "requested_count": len(expected),
+            "available_count": len(available),
+            "regime_symbol": PUBLIC_REGIME_SYMBOL,
+            "performance_benchmark_symbol": PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL,
+            "membership_file": membership_file,
+            "files": files,
+            "data_fingerprint_sha256": inventory_sha256(
+                [membership_file, *files]
+            ),
+        }
+    )
+    write_json_atomic(manifest, manifest_path)
+    return manifest
+
+
+def verify_public_cache(
+    membership_path: str | Path,
+    cache_dir: str | Path,
+    *,
+    seal_legacy: bool = False,
+    _allow_unsealed_files: bool = False,
+) -> dict[str, object]:
+    cache_dir = Path(cache_dir).resolve()
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.is_file():
+        if seal_legacy:
+            return seal_public_cache(membership_path, cache_dir)
+        raise FileNotFoundError(f"公开缓存缺少 manifest.json: {cache_dir}")
+    try:
+        manifest: dict[str, object] = json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError("公开缓存 manifest.json 不是有效 JSON") from exc
+    if (
+        manifest.get("schema_version") != PUBLIC_CACHE_SCHEMA_VERSION
+        or not manifest.get("files")
+        or not manifest.get("membership_file")
+    ):
+        if seal_legacy:
+            return seal_public_cache(membership_path, cache_dir)
+        raise ValueError("公开缓存尚未生成 v1.4 文件指纹")
+
+    verification = verify_file_inventory(cache_dir, manifest["files"])  # type: ignore[arg-type]
+    membership = load_membership(membership_path)
+    expected_symbols = sorted(
+        set(membership["symbol"].astype(str))
+        | {PUBLIC_REGIME_SYMBOL, PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL}
+    )
+    current_paths = {
+        _bar_path(cache_dir, symbol).resolve().relative_to(cache_dir).as_posix()
+        for symbol in expected_symbols
+        if _bar_path(cache_dir, symbol).is_file()
+    }
+    recorded_paths = {
+        str(item["path"])
+        for item in manifest["files"]  # type: ignore[union-attr]
+        if isinstance(item, dict) and "path" in item
+    }
+    unsealed_paths = sorted(current_paths.difference(recorded_paths))
+    missing_paths = sorted(recorded_paths.difference(current_paths))
+    if (unsealed_paths or missing_paths) and not _allow_unsealed_files:
+        raise ValueError("公开缓存清单与当前会读取的行情文件集合不一致")
+    current_membership = file_fingerprint(
+        membership_path, logical_path="membership.csv"
+    )
+    recorded_membership = manifest["membership_file"]
+    if not isinstance(recorded_membership, dict):
+        raise ValueError("公开缓存的历史成分文件指纹结构异常")
+    if (
+        current_membership["size_bytes"] != recorded_membership.get("size_bytes")
+        or current_membership["sha256"] != recorded_membership.get("sha256")
+    ):
+        raise ValueError("当前历史成分文件与公开缓存封存版本不一致")
+    combined = inventory_sha256([current_membership, *manifest["files"]])  # type: ignore[list-item]
+    if combined != manifest.get("data_fingerprint_sha256"):
+        raise ValueError("公开缓存总数据指纹与 manifest.json 不一致")
+    return {
+        **manifest,
+        "verification": {
+            **verification,
+            "unsealed_paths": unsealed_paths,
+            "missing_paths": missing_paths,
+        },
+    }
 
 
 def _load_cached_bars(cache_dir: str | Path, symbols: Iterable[str]) -> pd.DataFrame:
@@ -468,7 +718,15 @@ def _load_cached_bars(cache_dir: str | Path, symbols: Iterable[str]) -> pd.DataF
             continue
         frame = pd.read_csv(
             path,
-            usecols=["date", "symbol", "name", "open", "close", "amount"],
+            usecols=[
+                "date",
+                "symbol",
+                "name",
+                "open",
+                "close",
+                "volume",
+                "amount",
+            ],
             parse_dates=["date"],
         )
         frames.append(frame)
@@ -512,6 +770,93 @@ def _fee_rates(when: pd.Timestamp, config: PublicStrategyConfig) -> tuple[float,
     transfer = 0.00001 if when >= pd.Timestamp("2022-04-29") else 0.00002
     common = config.commission_rate + config.slippage_bps / 10_000.0 + transfer
     return common, common + stamp
+
+
+def _rebalance_public_positions(
+    current_positions: dict[str, float],
+    requested_target: dict[str, float],
+    tradable_symbols: set[str],
+    nav_open: float,
+    when: pd.Timestamp,
+    config: PublicStrategyConfig,
+) -> _PublicRebalance:
+    """Apply a weight-level rebalance without resizing suspended holdings.
+
+    Existing positions without an execution-day quote are locked at their carried
+    value. If fees make the requested book unaffordable, only executable targets are
+    scaled. Turnover and fees are then recomputed from the actually executable book.
+    """
+    if not np.isfinite(nav_open) or nav_open <= 0:
+        raise ValueError("公开回测调仓时净值必须为正数")
+    if any(not np.isfinite(value) or value < 0 for value in current_positions.values()):
+        raise ValueError("公开回测当前持仓市值必须是非负有限数")
+    if any(not np.isfinite(weight) or weight < 0 for weight in requested_target.values()):
+        raise ValueError("公开回测目标权重必须是非负有限数")
+
+    locked = {
+        symbol: float(value)
+        for symbol, value in current_positions.items()
+        if symbol not in tradable_symbols and value > 1e-12
+    }
+    requested_values = {
+        symbol: nav_open * float(weight)
+        for symbol, weight in requested_target.items()
+        if symbol in tradable_symbols and weight > 0
+    }
+    buy_rate, sell_rate = _fee_rates(when, config)
+
+    def evaluate(scale: float) -> _PublicRebalance:
+        executable_targets = {
+            symbol: value * scale
+            for symbol, value in requested_values.items()
+            if value * scale > 1e-12
+        }
+        positions = {**executable_targets, **locked}
+        all_symbols = set(current_positions) | set(positions)
+        buys = sum(
+            max(0.0, positions.get(symbol, 0.0) - current_positions.get(symbol, 0.0))
+            for symbol in all_symbols
+        )
+        sells = sum(
+            max(0.0, current_positions.get(symbol, 0.0) - positions.get(symbol, 0.0))
+            for symbol in all_symbols
+        )
+        cost = buys * buy_rate + sells * sell_rate
+        cash = nav_open - sum(positions.values()) - cost
+        return _PublicRebalance(
+            positions=positions,
+            cash=float(cash),
+            buys=float(buys),
+            sells=float(sells),
+            cost=float(cost),
+            locked_value=float(sum(locked.values())),
+            executable_scale=float(scale),
+        )
+
+    outcome = evaluate(1.0)
+    if outcome.cash >= -1e-12:
+        return _PublicRebalance(
+            **{**asdict(outcome), "cash": max(0.0, outcome.cash)}
+        )
+
+    # Cash is monotonic in this scale because fees are far below the traded value.
+    # Bisection avoids scaling locked holdings and also keeps fee calculations exact.
+    low = 0.0
+    high = 1.0
+    feasible = evaluate(low)
+    if feasible.cash < -1e-9:
+        raise RuntimeError("停牌锁定持仓后仍无法形成非负现金组合")
+    for _ in range(80):
+        midpoint = (low + high) / 2.0
+        candidate = evaluate(midpoint)
+        if candidate.cash >= 0:
+            low = midpoint
+            feasible = candidate
+        else:
+            high = midpoint
+    return _PublicRebalance(
+        **{**asdict(feasible), "cash": max(0.0, feasible.cash)}
+    )
 
 
 def _calculate_metrics(curve: pd.DataFrame, column: str = "nav") -> dict[str, float | int]:
@@ -638,8 +983,10 @@ def run_public_backtest(
     features = _build_features(bars, config.volatility_lookback)
 
     cache_dir = Path(cache_dir)
-    index_bars = _load_cached_bars(cache_dir, ["SH000300"]).sort_values("date")
-    benchmark_bars = _load_cached_bars(cache_dir, ["SH510300"]).sort_values("date")
+    index_bars = _load_cached_bars(cache_dir, [config.regime_symbol]).sort_values("date")
+    benchmark_bars = _load_cached_bars(
+        cache_dir, [config.performance_benchmark_symbol]
+    ).sort_values("date")
     index_bars["ma"] = index_bars["close"].rolling(
         config.benchmark_ma_days, min_periods=config.benchmark_ma_days
     ).mean()
@@ -691,41 +1038,47 @@ def run_public_backtest(
         if pending is not None:
             signal_date, requested_target, regime = pending
             nav_open = cash + sum(positions.values())
-            executable = {
-                symbol: weight
-                for symbol, weight in requested_target.items()
-                if symbol in today.index and float(today.at[symbol, "open"]) > 0
+            tradable_symbols = {
+                str(symbol)
+                for symbol in today.index
+                if float(today.at[symbol, "open"]) > 0
+                and float(today.at[symbol, "volume"]) > 0
+                and float(today.at[symbol, "amount"]) > 0
             }
-            missing_execution_symbols += len(requested_target) - len(executable)
-            target_values = {symbol: nav_open * weight for symbol, weight in executable.items()}
-            # A suspended existing position cannot be sold at a fictitious carried
-            # price. Keep it unchanged; a suspended new target stays as cash.
-            locked_positions = {
-                symbol: value for symbol, value in positions.items() if symbol not in today.index
-            }
-            target_values.update(locked_positions)
-            all_symbols = set(positions) | set(target_values)
-            buys = sum(max(0.0, target_values.get(symbol, 0.0) - positions.get(symbol, 0.0)) for symbol in all_symbols)
-            sells = sum(max(0.0, positions.get(symbol, 0.0) - target_values.get(symbol, 0.0)) for symbol in all_symbols)
-            buy_rate, sell_rate = _fee_rates(date, config)
-            cost = buys * buy_rate + sells * sell_rate
-            positions = {symbol: value for symbol, value in target_values.items() if value > 1e-12}
-            cash = nav_open - sum(positions.values()) - cost
-            if cash < -1e-9:
-                scale = max(0.0, (nav_open - cost) / max(sum(positions.values()), 1e-12))
-                positions = {symbol: value * scale for symbol, value in positions.items()}
-                cash = nav_open - sum(positions.values()) - cost
+            missing_execution_symbols += len(set(requested_target) - tradable_symbols)
+            outcome = _rebalance_public_positions(
+                positions,
+                requested_target,
+                tradable_symbols,
+                nav_open,
+                date,
+                config,
+            )
+            positions = outcome.positions
+            cash = outcome.cash
             rebalance_rows.append(
                 {
                     "signal_date": signal_date,
                     "execution_date": date,
                     "regime": regime,
-                    "buy_turnover": buys / nav_open if nav_open else 0.0,
-                    "sell_turnover": sells / nav_open if nav_open else 0.0,
-                    "one_way_turnover": (buys + sells) / (2.0 * nav_open) if nav_open else 0.0,
-                    "cost_rate": cost / nav_open if nav_open else 0.0,
+                    "buy_turnover": outcome.buys / nav_open if nav_open else 0.0,
+                    "sell_turnover": outcome.sells / nav_open if nav_open else 0.0,
+                    "one_way_turnover": (
+                        (outcome.buys + outcome.sells) / (2.0 * nav_open)
+                        if nav_open
+                        else 0.0
+                    ),
+                    "cost_rate": outcome.cost / nav_open if nav_open else 0.0,
                     "holding_count": len(positions),
-                    "target_exposure": sum(target_values.values()) / nav_open if nav_open else 0.0,
+                    "requested_target_exposure": float(sum(requested_target.values())),
+                    "actual_target_exposure": (
+                        sum(positions.values()) / nav_open if nav_open else 0.0
+                    ),
+                    "target_exposure": (
+                        sum(positions.values()) / nav_open if nav_open else 0.0
+                    ),
+                    "locked_exposure": outcome.locked_value / nav_open if nav_open else 0.0,
+                    "executable_scale": outcome.executable_scale,
                 }
             )
             pending = None
@@ -805,6 +1158,8 @@ def run_public_backtest(
         "missing_execution_symbols": missing_execution_symbols,
         "stale_position_marks": stale_marks,
         "adjustment": f"{cache_manifest.get('source', 'public cache')} hfq total-return price",
+        "regime_symbol": config.regime_symbol,
+        "performance_benchmark_symbol": config.performance_benchmark_symbol,
         "known_limitations": [
             "历史成分来自第三方对中证官方公告的规范化整理，并非中证公司原始机器接口",
             "公开接口没有可靠的历史 ST、历史行业和历史市值快照，因此本测试关闭对应过滤/中性化",
@@ -900,13 +1255,16 @@ def write_public_research(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     base_config = base_config or PublicStrategyConfig()
+    cache_manifest = verify_public_cache(
+        membership_path, cache_dir, seal_legacy=True
+    )
     metric_rows: list[dict[str, object]] = []
     results: dict[str, PublicBacktestResult] = {}
     periods = {
         "development_2013_2017": ("2013-01-01", "2017-12-31"),
         "validation_2018_2021": ("2018-01-01", "2021-12-31"),
-        "oos_2022_2025": ("2022-01-01", "2025-12-31"),
-        "full_2013_2025": (base_config.start_date, base_config.end_date),
+        "historical_holdout_seen_2022_2025": ("2022-01-01", "2025-12-31"),
+        "full_requested_period": (base_config.start_date, base_config.end_date),
     }
     for variant in public_strategy_variants(base_config):
         LOGGER.info("运行公开数据策略: %s", variant.name)
@@ -959,7 +1317,9 @@ def write_public_research(
         linestyle="--",
         linewidth=1.5,
     )
-    axis.set_title("Public-data strategy comparison (2013–2025)")
+    axis.set_title(
+        f"Public-data strategy comparison ({base_config.start_date}–{base_config.end_date})"
+    )
     axis.set_ylabel("NAV")
     axis.grid(alpha=0.25)
     axis.legend(fontsize=8, ncol=2)
@@ -987,16 +1347,18 @@ def write_public_research(
             f"{percentage(row.max_drawdown)} | {row.sharpe:.2f} | "
             f"{percentage(row.benchmark_cagr)} | {percentage(row.annual_one_way_turnover)} |"
         )
-    oos = metrics.loc[metrics["period"].eq("oos_2022_2025")].sort_values("cagr", ascending=False)
-    best_oos = oos.iloc[0]
+    holdout = metrics.loc[
+        metrics["period"].eq("historical_holdout_seen_2022_2025")
+    ].sort_values("cagr", ascending=False)
+    best_holdout = holdout.iloc[0]
     report_lines.extend(
         [
             "",
             "## 结果判读",
             "",
-            f"- 冻结样本外期年化最高的是 `{best_oos['strategy']}`：{percentage(best_oos['cagr'])}，最大回撤 {percentage(best_oos['max_drawdown'])}。这只是预定义方案之间的比较，不是收益承诺。",
-            f"- 样本外是否达到 15%：{'是' if float(best_oos['cagr']) >= 0.15 else '否'}。未达到时不通过扩大杠杆或回看样本外调参来硬凑目标。",
-            "- 开发期、验证期与样本外期应一起看；只在单一区间突出的方案应视为不稳定。",
+            f"- 已查看历史保留期年化最高的是 `{best_holdout['strategy']}`：{percentage(best_holdout['cagr'])}，最大回撤 {percentage(best_holdout['max_drawdown'])}。这只是预定义方案之间的比较，不是收益承诺。",
+            f"- 该历史保留期是否达到 15%：{'是' if float(best_holdout['cagr']) >= 0.15 else '否'}。2022–2025 的结果已经被查看，今后不能再把它当作未触碰样本外反复调参。",
+            "- 开发期、验证期与已查看保留期应一起看；下一段真正的前瞻验证应使用 2026 年以后未参与调参的数据或模拟盘。",
             "",
             "## 公开数据口径限制",
             "",
@@ -1024,18 +1386,60 @@ def write_public_research(
         "cache_dir": str(Path(cache_dir).resolve()),
         "periods": periods,
         "selection_protocol": (
-            "六组参数均在运行前预定义；开发期仅用于比较，不根据 2022-2025 样本外结果反向改参。"
+            "六组参数最初在 v1.3 运行前预定义；2022-2025 结果现已查看，"
+            "不得在后续研究中继续宣称为未触碰样本外。"
         ),
+        "period_status": {
+            "development_2013_2017": "seen_development",
+            "validation_2018_2021": "seen_validation",
+            "historical_holdout_seen_2022_2025": "seen_historical_holdout",
+            "full_requested_period": "seen_aggregate",
+            "prospective_2026_onward": "researcher_managed_not_automatically_certified",
+        },
         "variants": [asdict(value) for value in public_strategy_variants(base_config)],
         "limitations": next(iter(results.values())).data_quality["known_limitations"],
+        "data_fingerprint_sha256": cache_manifest.get(
+            "data_fingerprint_sha256"
+        ),
+        "cache_verification": cache_manifest.get("verification", {"verified": True}),
     }
+    reproducibility = build_reproducibility_manifest(
+        {
+            "base_config": asdict(base_config),
+            "variants": [asdict(value) for value in public_strategy_variants(base_config)],
+            "periods": periods,
+        },
+        data_manifest_path=Path(cache_dir) / "manifest.json",
+        extra_input_files=[membership_path],
+    )
+    reproducibility_path = write_json_atomic(
+        reproducibility, output_dir / "reproducibility.json"
+    )
+    manifest["reproducibility_file"] = reproducibility_path.name
+    manifest["run_fingerprint_sha256"] = reproducibility[
+        "run_fingerprint_sha256"
+    ]
     manifest_path = output_dir / "research_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    registry_path = record_experiment(
+        output_dir / "experiment_registry.jsonl",
+        reproducibility,
+        experiment_type="public_research",
+        protocol={
+            "parameters": "six_predeclared_v1_3_variants",
+            "historical_holdout_2022_2025": "seen",
+            "prospective_holdout_start": "2026-01-01",
+            "untouched_holdout_certified": False,
+        },
+        artifacts=[report_path, metrics_path, chart_path, manifest_path, reproducibility_path],
+    )
     return {
         "report": report_path,
         "metrics": metrics_path,
         "chart": chart_path,
         "manifest": manifest_path,
+        "reproducibility": reproducibility_path,
+        "registry": registry_path,
         "output_dir": output_dir,
     }
 
@@ -1050,12 +1454,15 @@ def write_public_robustness(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     base_config = base_config or PublicStrategyConfig()
+    cache_manifest = verify_public_cache(
+        membership_path, cache_dir, seal_legacy=True
+    )
     candidate = next(
         variant for variant in public_strategy_variants(base_config) if variant.name == "momentum_focus_15"
     )
     periods = {
-        "oos_2022_2025": ("2022-01-01", "2025-12-31"),
-        "full_2013_2025": (candidate.start_date, candidate.end_date),
+        "historical_holdout_seen_2022_2025": ("2022-01-01", "2025-12-31"),
+        "full_requested_period": (candidate.start_date, candidate.end_date),
     }
 
     cost_rows: list[dict[str, object]] = []
@@ -1107,7 +1514,7 @@ def write_public_robustness(
     lines = [
         "# 公开数据稳健性检查",
         "",
-        "候选参数在查看冻结样本外结果前已固定为 `momentum_focus_15`。本页只提高成本和删除因子，不根据结果重新优化权重。",
+        "候选参数最初在查看 2022–2025 结果前固定为 `momentum_focus_15`。该区间现已查看，本页只提高成本和删除因子，不再把它宣称为未触碰样本外。",
         "",
         "## 滑点压力",
         "",
@@ -1135,4 +1542,38 @@ def write_public_robustness(
         )
     report_path = output_dir / "PUBLIC_ROBUSTNESS_REPORT.md"
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return {"report": report_path, "cost": cost_path, "ablation": ablation_path}
+    reproducibility = build_reproducibility_manifest(
+        {
+            "candidate": asdict(candidate),
+            "periods": periods,
+            "cost_slippage_bps": [5.0, 10.0, 20.0],
+            "factor_ablation": list(factor_fields),
+            "data_fingerprint_sha256": cache_manifest.get(
+                "data_fingerprint_sha256"
+            ),
+        },
+        data_manifest_path=Path(cache_dir) / "manifest.json",
+        extra_input_files=[membership_path],
+    )
+    reproducibility_path = write_json_atomic(
+        reproducibility, output_dir / "reproducibility.json"
+    )
+    registry_path = record_experiment(
+        output_dir / "experiment_registry.jsonl",
+        reproducibility,
+        experiment_type="public_robustness",
+        protocol={
+            "candidate": "momentum_focus_15",
+            "historical_holdout_2022_2025": "seen",
+            "optimization": "none_cost_stress_and_ablation_only",
+            "untouched_holdout_certified": False,
+        },
+        artifacts=[report_path, cost_path, ablation_path, reproducibility_path],
+    )
+    return {
+        "report": report_path,
+        "cost": cost_path,
+        "ablation": ablation_path,
+        "reproducibility": reproducibility_path,
+        "registry": registry_path,
+    }

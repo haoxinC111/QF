@@ -3,6 +3,9 @@ data:
   cache_dir: data/cache
   token_env: TUSHARE_TOKEN
   universe_index: 399300.SZ
+  # 价格指数只用于 200 日均线风险开关；不要和业绩比较基准混用。
+  regime_index: 000300.SH
+  # 全收益指数只用于净值比较与超额收益计算。
   benchmark_index: H00300.CSI
   benchmark_is_total_return: true
   calls_per_minute: 180

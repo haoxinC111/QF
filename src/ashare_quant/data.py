@@ -11,9 +11,11 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from .config import AppConfig
+from .config import AppConfig, DataConfig
+from .provenance import build_file_inventory, inventory_sha256, verify_file_inventory
 
 LOGGER = logging.getLogger(__name__)
+CACHE_SCHEMA_VERSION = 4
 
 BAR_COLUMNS = {
     "date",
@@ -97,11 +99,20 @@ class MarketDataBundle:
     industry_membership: pd.DataFrame = field(
         default_factory=lambda: pd.DataFrame(columns=INDUSTRY_COLUMNS)
     )
+    regime: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     def prepare(self, strict: bool = True) -> "MarketDataBundle":
         bars = self.bars.copy()
         membership = self.membership.copy()
         benchmark = self.benchmark.copy()
+        regime = self.regime.copy() if isinstance(self.regime, pd.DataFrame) else pd.DataFrame()
+        if regime.empty:
+            if strict:
+                raise ValueError(
+                    "缺少独立择时指数 regime；v1.4 不允许用业绩基准静默替代"
+                )
+            # Non-strict ad-hoc analysis can opt into the legacy fallback explicitly.
+            regime = benchmark.copy()
         actions = self.corporate_actions.copy()
         securities = self.securities.copy()
         industries = self.industry_membership.copy()
@@ -109,7 +120,7 @@ class MarketDataBundle:
         missing = BAR_COLUMNS.difference(bars.columns)
         if missing:
             raise ValueError(f"bars 缺少字段: {sorted(missing)}")
-        for frame in (bars, membership, benchmark):
+        for frame in (bars, membership, benchmark, regime):
             if "date" not in frame.columns:
                 raise ValueError("数据表缺少 date 字段")
             frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
@@ -143,11 +154,12 @@ class MarketDataBundle:
         membership["index_weight"] = pd.to_numeric(
             membership.get("index_weight", 0.0), errors="coerce"
         ).fillna(0.0)
-        if "close" not in benchmark.columns:
-            raise ValueError("benchmark 缺少 close 字段")
-        for column in ["open", "high", "low", "close", "prev_close"]:
-            if column in benchmark.columns:
-                benchmark[column] = pd.to_numeric(benchmark[column], errors="coerce")
+        for label, frame in (("benchmark", benchmark), ("regime", regime)):
+            if "close" not in frame.columns:
+                raise ValueError(f"{label} 缺少 close 字段")
+            for column in ["open", "high", "low", "close", "prev_close"]:
+                if column in frame.columns:
+                    frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
         if actions.empty:
             actions = pd.DataFrame(columns=ACTION_COLUMNS)
@@ -187,6 +199,7 @@ class MarketDataBundle:
             ["date", "symbol"], keep="last"
         )
         benchmark = benchmark.sort_values("date").drop_duplicates("date", keep="last")
+        regime = regime.sort_values("date").drop_duplicates("date", keep="last")
         actions = actions.sort_values(["ex_date", "symbol"]).drop_duplicates(
             ["symbol", "ex_date"], keep="last"
         )
@@ -232,6 +245,10 @@ class MarketDataBundle:
                 raise ValueError("基准收盘价存在 NaN 或无穷值")
             if (benchmark["close"] <= 0).any():
                 raise ValueError("基准收盘价必须为正数")
+            if not np.isfinite(regime["close"].to_numpy(dtype=float)).all():
+                raise ValueError("择时指数收盘价存在 NaN 或无穷值")
+            if (regime["close"] <= 0).any():
+                raise ValueError("择时指数收盘价必须为正数")
             if actions["ex_date"].isna().any():
                 raise ValueError("公司行动必须包含有效 ex_date")
             if (actions[["cash_dividend", "stock_dividend"]] < 0).any().any():
@@ -250,8 +267,8 @@ class MarketDataBundle:
                 )
                 if invalid_interval.any():
                     raise ValueError("行业成员记录的 out_date 不能早于 in_date")
-        if bars.empty or membership.empty or benchmark.empty:
-            raise ValueError("行情、成分或基准数据不能为空")
+        if bars.empty or membership.empty or benchmark.empty or regime.empty:
+            raise ValueError("行情、成分、业绩基准或择时指数数据不能为空")
 
         calendar = pd.DatetimeIndex(pd.to_datetime(self.calendar)).normalize().unique().sort_values()
         if calendar.empty:
@@ -265,12 +282,12 @@ class MarketDataBundle:
                     "历史成分缺少行情文件: " + ", ".join(missing_bar_symbols[:10])
                 )
             if securities.empty:
-                raise ValueError("缺少证券主表 securities，请重新下载 v3 数据缓存")
+                raise ValueError("缺少证券主表 securities，请重新下载 v4 数据缓存")
             missing_master = sorted(member_symbols.difference(set(securities["symbol"])))
             if missing_master:
                 raise ValueError("证券主表缺少历史成分: " + ", ".join(missing_master[:10]))
             if industries.empty:
-                raise ValueError("缺少行业成员表 industry_membership，请重新下载 v3 数据缓存")
+                raise ValueError("缺少行业成员表 industry_membership，请重新下载 v4 数据缓存")
             missing_industry = sorted(member_symbols.difference(set(industries["symbol"])))
             if missing_industry:
                 raise ValueError("行业成员表缺少历史成分: " + ", ".join(missing_industry[:10]))
@@ -312,6 +329,17 @@ class MarketDataBundle:
                     f"基准行情缺少 {len(missing_benchmark_dates)} 个交易日，"
                     f"首个缺口为 {missing_benchmark_dates[0].date()}"
                 )
+            if not set(regime["date"]).issubset(set(calendar)):
+                raise ValueError("择时指数行情包含交易日历之外的日期")
+            expected_regime_dates = set(
+                calendar[(calendar >= regime["date"].min()) & (calendar <= regime["date"].max())]
+            )
+            missing_regime_dates = sorted(expected_regime_dates.difference(set(regime["date"])))
+            if missing_regime_dates:
+                raise ValueError(
+                    f"择时指数行情缺少 {len(missing_regime_dates)} 个交易日，"
+                    f"首个缺口为 {missing_regime_dates[0].date()}"
+                )
             snapshot_dates = pd.DatetimeIndex(sorted(membership["date"].unique()))
             if len(snapshot_dates) > 1 and snapshot_dates.to_series().diff().dt.days.max() > 62:
                 raise ValueError("历史指数成分快照存在超过 62 天的断档")
@@ -323,48 +351,133 @@ class MarketDataBundle:
             corporate_actions=actions.reset_index(drop=True),
             securities=securities.reset_index(drop=True),
             industry_membership=industries.reset_index(drop=True),
+            regime=regime.reset_index(drop=True),
         )
 
     @classmethod
-    def from_cache(cls, cache_dir: str | Path, strict: bool = True) -> "MarketDataBundle":
+    def from_cache(
+        cls,
+        cache_dir: str | Path,
+        strict: bool = True,
+        expected_config: AppConfig | DataConfig | None = None,
+    ) -> "MarketDataBundle":
         root = Path(cache_dir)
+        manifest_path = root / "manifest.json"
         membership_path = root / "membership.csv.gz"
         benchmark_path = root / "benchmark.csv.gz"
+        regime_path = root / "regime.csv.gz"
         actions_path = root / "corporate_actions.csv.gz"
         securities_path = root / "securities.csv.gz"
         industries_path = root / "industry_membership.csv.gz"
+        calendar_path = root / "calendar.csv.gz"
         bar_paths = sorted((root / "bars").glob("*.csv.gz"))
         if (
-            not membership_path.exists()
+            not manifest_path.exists()
+            or not membership_path.exists()
             or not benchmark_path.exists()
+            or not regime_path.exists()
             or not actions_path.exists()
             or not securities_path.exists()
             or not industries_path.exists()
+            or not calendar_path.exists()
             or not bar_paths
         ):
             raise FileNotFoundError(
-                f"v3 缓存不完整: {root}。请设置 refresh=true 后重新运行 download。"
+                f"v4 缓存不完整: {root}。请设置 refresh=true 后重新运行 download。"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"缓存 manifest.json 不是有效 JSON: {root}") from exc
+        if manifest.get("schema_version") != CACHE_SCHEMA_VERSION:
+            raise ValueError(
+                f"缓存结构版本为 {manifest.get('schema_version')!r}，"
+                f"当前要求 v{CACHE_SCHEMA_VERSION}；请设置 refresh=true 后重新下载。"
+            )
+        if expected_config is not None:
+            data_config = (
+                expected_config.data
+                if isinstance(expected_config, AppConfig)
+                else expected_config
+            )
+            expected_fields = {
+                "provider": data_config.provider,
+                "universe_index": data_config.universe_index,
+                "regime_index": data_config.regime_index,
+                "benchmark_index": data_config.benchmark_index,
+                "industry_standard": data_config.industry_standard,
+                "industry_level": data_config.industry_level,
+            }
+            mismatches = {
+                name: {"cache": manifest.get(name), "config": value}
+                for name, value in expected_fields.items()
+                if manifest.get(name) != value
+            }
+            if mismatches:
+                raise ValueError(f"缓存数据身份与当前配置不匹配: {mismatches}")
+            if isinstance(expected_config, AppConfig):
+                required_start = pd.Timestamp(
+                    expected_config.backtest.start_date
+                ) - pd.Timedelta(data_config.warmup_calendar_days, unit="D")
+                required_end = pd.Timestamp(expected_config.backtest.end_date)
+                try:
+                    cached_start = pd.Timestamp(manifest["requested_start"])
+                    cached_end = pd.Timestamp(manifest["requested_end"])
+                except (KeyError, ValueError) as exc:
+                    raise ValueError("缓存 manifest 缺少有效请求日期范围") from exc
+                if cached_start > required_start or cached_end < required_end:
+                    raise ValueError(
+                        "缓存日期范围不足: "
+                        f"缓存={cached_start.date()}..{cached_end.date()}，"
+                        f"需要={required_start.date()}..{required_end.date()}"
+                    )
+        verification = verify_file_inventory(root, manifest.get("files", []))
+        expected = str(manifest.get("data_fingerprint_sha256", ""))
+        if verification["inventory_sha256"] != expected:
+            raise ValueError("缓存文件清单指纹与 manifest.json 不一致")
+        recorded_paths = {
+            str(item["path"])
+            for item in manifest.get("files", [])
+            if isinstance(item, dict) and "path" in item
+        }
+        consumed_paths = {
+            path.resolve().relative_to(root.resolve()).as_posix()
+            for path in [
+                membership_path,
+                benchmark_path,
+                regime_path,
+                actions_path,
+                securities_path,
+                industries_path,
+                calendar_path,
+                *bar_paths,
+            ]
+        }
+        if recorded_paths != consumed_paths:
+            unsealed = sorted(consumed_paths.difference(recorded_paths))
+            unused = sorted(recorded_paths.difference(consumed_paths))
+            raise ValueError(
+                "缓存清单与实际读取文件集合不一致；"
+                f"未封存={unsealed[:5]}，未使用={unused[:5]}"
             )
         bars = pd.concat((pd.read_csv(path) for path in bar_paths), ignore_index=True)
         membership = pd.read_csv(membership_path)
         benchmark = pd.read_csv(benchmark_path)
+        regime = pd.read_csv(regime_path)
         actions = pd.read_csv(actions_path)
         securities = pd.read_csv(securities_path)
         industries = pd.read_csv(industries_path)
-        calendar_path = root / "calendar.csv.gz"
-        if calendar_path.exists():
-            calendar_frame = pd.read_csv(calendar_path)
-            calendar = pd.DatetimeIndex(pd.to_datetime(calendar_frame["date"]))
-        else:
-            calendar = pd.DatetimeIndex(pd.to_datetime(benchmark["date"]))
+        calendar_frame = pd.read_csv(calendar_path)
+        calendar = pd.DatetimeIndex(pd.to_datetime(calendar_frame["date"]))
         return cls(
-            bars,
-            membership,
-            benchmark,
-            calendar,
-            actions,
-            securities,
-            industries,
+            bars=bars,
+            membership=membership,
+            benchmark=benchmark,
+            calendar=calendar,
+            corporate_actions=actions,
+            securities=securities,
+            industry_membership=industries,
+            regime=regime,
         ).prepare(strict=strict)
 
 
@@ -422,20 +535,24 @@ class TushareDownloader:
     def download(self) -> MarketDataBundle:
         start = pd.Timestamp(self.config.backtest.start_date)
         end = pd.Timestamp(self.config.backtest.end_date)
-        warmup_start = start - pd.Timedelta(days=self.config.data.warmup_calendar_days)
+        warmup_start = start - pd.Timedelta(
+            self.config.data.warmup_calendar_days, unit="D"
+        )
         manifest_path = self.root / "manifest.json"
 
         if not self.config.data.refresh and self._manifest_covers(manifest_path, warmup_start, end):
             LOGGER.info("命中完整本地缓存，跳过下载")
             return MarketDataBundle.from_cache(
-                self.root, strict=self.config.data.strict_validation
+                self.root,
+                strict=self.config.data.strict_validation,
+                expected_config=self.config,
             )
 
         self.root.mkdir(parents=True, exist_ok=True)
         LOGGER.info("下载交易日历")
         calendar = self._fetch_calendar(warmup_start, end)
         LOGGER.info("下载历史指数成分")
-        membership = self._fetch_membership(start - pd.Timedelta(days=62), end)
+        membership = self._fetch_membership(start - pd.Timedelta(62, unit="D"), end)
         if membership.empty:
             raise RuntimeError("未取得指数成分数据，请检查指数代码和 Tushare 权限")
         _atomic_csv(membership, self.root / "membership.csv.gz")
@@ -485,15 +602,30 @@ class TushareDownloader:
             ]
         _atomic_csv(corporate_actions, self.root / "corporate_actions.csv.gz")
 
-        LOGGER.info("下载基准指数行情")
+        LOGGER.info("下载全收益业绩基准行情")
         benchmark = self._fetch_benchmark(warmup_start, end)
         _atomic_csv(benchmark, self.root / "benchmark.csv.gz")
+        LOGGER.info("下载价格择时指数行情")
+        regime = self._fetch_regime(warmup_start, end)
+        _atomic_csv(regime, self.root / "regime.csv.gz")
         _atomic_csv(pd.DataFrame({"date": calendar}), self.root / "calendar.csv.gz")
+        cache_inputs = [
+            self.root / "membership.csv.gz",
+            self.root / "securities.csv.gz",
+            self.root / "industry_membership.csv.gz",
+            self.root / "corporate_actions.csv.gz",
+            self.root / "benchmark.csv.gz",
+            self.root / "regime.csv.gz",
+            self.root / "calendar.csv.gz",
+            *sorted(bar_dir.glob("*.csv.gz")),
+        ]
+        files = build_file_inventory(self.root, cache_inputs)
         _atomic_json(
             {
-                "schema_version": 3,
+                "schema_version": CACHE_SCHEMA_VERSION,
                 "provider": "tushare",
                 "universe_index": self.config.data.universe_index,
+                "regime_index": self.config.data.regime_index,
                 "benchmark_index": self.config.data.benchmark_index,
                 "industry_standard": self.config.data.industry_standard,
                 "industry_level": self.config.data.industry_level,
@@ -501,11 +633,15 @@ class TushareDownloader:
                 "requested_end": end.strftime("%Y-%m-%d"),
                 "created_at_utc": pd.Timestamp.utcnow().isoformat(),
                 "symbols": len(symbols),
+                "files": files,
+                "data_fingerprint_sha256": inventory_sha256(files),
             },
             manifest_path,
         )
         return MarketDataBundle.from_cache(
-            self.root, strict=self.config.data.strict_validation
+            self.root,
+            strict=self.config.data.strict_validation,
+            expected_config=self.config,
         )
 
     @staticmethod
@@ -526,10 +662,16 @@ class TushareDownloader:
             member_dates = membership.loc[membership["symbol"].eq(symbol), "date"]
             if member_dates.empty:
                 return False
-            first_needed = max(requested_start, pd.Timestamp(member_dates.min()) - pd.Timedelta(days=400))
-            last_needed = min(requested_end, pd.Timestamp(member_dates.max()) + pd.Timedelta(days=10))
-            start_ok = dates.min() <= first_needed + pd.Timedelta(days=10)
-            end_ok = dates.max() >= last_needed - pd.Timedelta(days=10)
+            first_needed = max(
+                requested_start,
+                pd.Timestamp(member_dates.min()) - pd.Timedelta(400, unit="D"),
+            )
+            last_needed = min(
+                requested_end,
+                pd.Timestamp(member_dates.max()) + pd.Timedelta(10, unit="D"),
+            )
+            start_ok = dates.min() <= first_needed + pd.Timedelta(10, unit="D")
+            end_ok = dates.max() >= last_needed - pd.Timedelta(10, unit="D")
             return bool(start_ok and end_ok)
         except (OSError, ValueError, KeyError):
             return False
@@ -540,10 +682,11 @@ class TushareDownloader:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             return (
-                payload.get("schema_version") == 3
+                payload.get("schema_version") == CACHE_SCHEMA_VERSION
                 and
                 payload.get("provider") == "tushare"
                 and payload.get("universe_index") == self.config.data.universe_index
+                and payload.get("regime_index") == self.config.data.regime_index
                 and payload.get("benchmark_index") == self.config.data.benchmark_index
                 and payload.get("industry_standard") == self.config.data.industry_standard
                 and payload.get("industry_level") == self.config.data.industry_level
@@ -817,15 +960,32 @@ class TushareDownloader:
         return 0.10
 
     def _fetch_benchmark(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        return self._fetch_index(
+            self.config.data.benchmark_index, start, end, label="业绩基准"
+        )
+
+    def _fetch_regime(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        return self._fetch_index(
+            self.config.data.regime_index, start, end, label="择时指数"
+        )
+
+    def _fetch_index(
+        self,
+        ts_code: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        *,
+        label: str,
+    ) -> pd.DataFrame:
         frame = self.client.call(
             "index_daily",
-            ts_code=self.config.data.benchmark_index,
+            ts_code=ts_code,
             start_date=start.strftime("%Y%m%d"),
             end_date=end.strftime("%Y%m%d"),
             fields="ts_code,trade_date,open,high,low,close,pre_close,pct_chg",
         )
         if frame.empty:
-            raise RuntimeError("基准指数行情为空")
+            raise RuntimeError(f"{label}行情为空: {ts_code}")
         return (
             frame.rename(columns={"trade_date": "date", "pre_close": "prev_close"})
             .assign(date=lambda value: pd.to_datetime(value["date"], format="%Y%m%d"))
@@ -910,7 +1070,7 @@ def make_demo_bundle(
             "industry": [f"IND{index % 8}" for index in range(symbols)],
             "market": "DEMO",
             "list_status": "L",
-            "list_date": pd.Timestamp(start) - pd.Timedelta(days=1000),
+            "list_date": pd.Timestamp(start) - pd.Timedelta(1000, unit="D"),
             "delist_date": pd.NaT,
         }
     )
@@ -920,16 +1080,17 @@ def make_demo_bundle(
             "symbol": sorted(bars["symbol"].unique()),
             "industry_code": [f"801{index % 8:03d}.SI" for index in range(symbols)],
             "industry_name": [f"IND{index % 8}" for index in range(symbols)],
-            "in_date": pd.Timestamp(start) - pd.Timedelta(days=1000),
+            "in_date": pd.Timestamp(start) - pd.Timedelta(1000, unit="D"),
             "out_date": pd.NaT,
         }
     )
     return MarketDataBundle(
-        bars,
-        membership,
-        benchmark,
-        calendar,
-        actions,
-        securities,
-        industry_membership,
+        bars=bars,
+        membership=membership,
+        benchmark=benchmark,
+        calendar=calendar,
+        corporate_actions=actions,
+        securities=securities,
+        industry_membership=industry_membership,
+        regime=benchmark.copy(),
     ).prepare()

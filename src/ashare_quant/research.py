@@ -11,6 +11,11 @@ from .backtest import Backtester
 from .config import AppConfig
 from .data import MarketDataBundle
 from .report import calculate_metrics
+from .provenance import (
+    build_reproducibility_manifest,
+    record_experiment,
+    write_json_atomic,
+)
 
 
 FACTOR_FIELDS = {
@@ -115,7 +120,7 @@ def run_rolling_oos(
     window = 1
     while test_start < overall_end:
         test_end = min(
-            test_start + pd.DateOffset(years=test_years) - pd.Timedelta(days=1),
+            test_start + pd.DateOffset(years=test_years) - pd.Timedelta(1, unit="D"),
             overall_end,
         )
         case_config = replace(
@@ -131,13 +136,13 @@ def run_rolling_oos(
             {
                 "window": window,
                 "train_start": overall_start.strftime("%Y-%m-%d"),
-                "train_end": (test_start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+                "train_end": (test_start - pd.Timedelta(1, unit="D")).strftime("%Y-%m-%d"),
                 "test_start": test_start.strftime("%Y-%m-%d"),
                 "test_end": test_end.strftime("%Y-%m-%d"),
                 **metrics,
             }
         )
-        test_start = test_end + pd.Timedelta(days=1)
+        test_start = test_end + pd.Timedelta(1, unit="D")
         window += 1
     return pd.DataFrame(records)
 
@@ -193,11 +198,49 @@ def write_research_suite(
         "train_years": train_years,
         "test_years": test_years,
         "note": "滚动样本外使用冻结参数；训练窗只表示参数研究与冻结区间，不执行自动寻优。",
+        "evaluation_protocol": "fixed_parameter_rolling_evaluation",
+        "automatic_parameter_fitting": False,
+        "untouched_holdout_certified": False,
         "files": {name: path.name for name, path in written.items()},
     }
+    reproducibility = build_reproducibility_manifest(
+        {
+            "app_config": config.to_dict(),
+            "research": {
+                "modes": requested,
+                "slippage_bps": list(map(float, slippage_bps)),
+                "commission_multipliers": list(
+                    map(float, commission_multipliers)
+                ),
+                "train_years": train_years,
+                "test_years": test_years,
+            },
+        },
+        data_manifest_path=Path(config.data.cache_dir) / "manifest.json",
+    )
+    reproducibility_path = write_json_atomic(
+        reproducibility, output / "reproducibility.json"
+    )
+    manifest["reproducibility_file"] = reproducibility_path.name
+    manifest["run_fingerprint_sha256"] = reproducibility[
+        "run_fingerprint_sha256"
+    ]
     manifest_path = output / "research_manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     written["manifest"] = manifest_path
+    written["reproducibility"] = reproducibility_path
+    registry_path = record_experiment(
+        output / "experiment_registry.jsonl",
+        reproducibility,
+        experiment_type="strict_research_suite",
+        protocol={
+            "evaluation": "fixed_parameter_rolling_evaluation",
+            "automatic_parameter_fitting": False,
+            "untouched_holdout_certified": False,
+        },
+        artifacts=[*written.values()],
+    )
+    written["registry"] = registry_path
     return written

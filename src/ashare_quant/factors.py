@@ -120,11 +120,11 @@ class MultiFactorStrategy:
             str(symbol): group.sort_values(["in_date", "out_date"], na_position="last")
             for symbol, group in self.bundle.industry_membership.groupby("symbol", sort=False)
         }
-        benchmark = self.bundle.benchmark[["date", "close"]].copy().sort_values("date")
-        benchmark["ma"] = benchmark["close"].rolling(
+        regime = self.bundle.regime[["date", "close"]].copy().sort_values("date")
+        regime["ma"] = regime["close"].rolling(
             config.benchmark_ma_days, min_periods=config.benchmark_ma_days
         ).mean()
-        self.benchmark = benchmark.set_index("date")
+        self.regime_index = regime.set_index("date")
 
     def _build_features(self, bars: pd.DataFrame) -> pd.DataFrame:
         frame = bars.copy().sort_values(["symbol", "date"])
@@ -186,7 +186,7 @@ class MultiFactorStrategy:
         return str(latest["industry_code"]), str(latest["industry_name"])
 
     def _regime_at(self, signal_date: pd.Timestamp) -> tuple[str, float]:
-        history = self.benchmark.loc[self.benchmark.index <= signal_date]
+        history = self.regime_index.loc[self.regime_index.index <= signal_date]
         if history.empty:
             return "RISK_OFF", self.config.risk_off_exposure
         latest = history.iloc[-1]

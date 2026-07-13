@@ -20,6 +20,7 @@ class DataConfig:
     cache_dir: str = "data/cache"
     token_env: str = "TUSHARE_TOKEN"
     universe_index: str = "399300.SZ"
+    regime_index: str = "000300.SH"
     benchmark_index: str = "H00300.CSI"
     benchmark_is_total_return: bool = True
     calls_per_minute: int = 180
@@ -227,6 +228,18 @@ class AppConfig:
             raise ValueError("industry_standard 仅支持 SW2014 或 SW2021")
         if self.data.industry_level not in {"L1", "L2", "L3"}:
             raise ValueError("industry_level 仅支持 L1、L2 或 L3")
+        for name, value in {
+            "universe_index": self.data.universe_index,
+            "regime_index": self.data.regime_index,
+            "benchmark_index": self.data.benchmark_index,
+        }.items():
+            if not str(value).strip():
+                raise ValueError(f"{name} 不能为空")
+        if (
+            self.data.benchmark_is_total_return
+            and self.data.regime_index == self.data.benchmark_index
+        ):
+            raise ValueError("全收益业绩基准不能同时作为价格择时指数")
         if self.execution.lot_size <= 0:
             raise ValueError("lot_size 必须大于 0")
         if min(

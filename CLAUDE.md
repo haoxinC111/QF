@@ -19,6 +19,7 @@
   - `v1.0.0`：基础严格回测引擎
   - `v1.2.0`：严格通道升级（行业/市值中性化、股份账本、研究套件）
   - `v1.3.0`：新增公开数据源研究通道（新浪财经/东方财富）
+  - `v1.4.0`：修复公开停牌锁仓缩放，分离择时/业绩基准，加入数据与运行指纹
 
 ## 3. ZIP 处理标准流程
 
@@ -31,7 +32,7 @@
    ```
 2. **核对顶层结构**：有的版本把项目放在 `a_share_quant/` 子目录下，有的直接放在根目录。解压后先确认 `run.py` 和 `src/ashare_quant/` 的位置。
 3. **与当前代码做差异比较**：
-   - 核心模块：`src/ashare_quant/{config,data,factors,backtest,report,cli,research,public_research}.py`
+   - 核心模块：`src/ashare_quant/{config,data,factors,backtest,report,cli,research,public_research,provenance}.py`
    - 配置：`config.example.yaml`、`pyproject.toml`、`requirements*.txt`
    - 文档：`README.md`、`V1.*_VALIDATION.md`、`PUBLIC_SOURCE_AUDIT.md`
    - 测试：`tests/`
@@ -57,7 +58,8 @@
 - **严格通道**：需要 `TUSHARE_TOKEN` 环境变量，且账号积分至少 2000。
 - **公开通道**：必须准备 `unliftedq/index-constitution` 的 `history/csi300.csv`，固定提交 `16d9d69fc0bf7f0f5e9aace868e16e26f2ecb5c2`。
 - 首次运行公开回测时需要联网下载行情缓存到 `data/public_eastmoney/`。
-- v1.2/v1.3 的严格缓存格式与 v1.0 不兼容，需要 `data.refresh: true` 重新生成 v3 缓存。
+- v1.4 的严格缓存为 v4，新增 `regime.csv.gz` 和逐文件 SHA256；旧 v3 缓存需要 `data.refresh: true` 重新生成。
+- v1.3 公开缓存无需重下，先运行 `public-verify --seal-legacy` 生成指纹；此后校验失败不得自动覆盖或重新封存。
 
 ### 4.4 网络与环境
 - 确认能访问 `finance.sina.com.cn` 和/或东方财富公开接口。
@@ -66,7 +68,7 @@
 
 ### 4.5 配置
 - 用 `config.example.yaml` 生成 `config.yaml`，不要直接修改示例文件。
-- v1.2/v1.3 相比 v1.0 新增了大量字段（行业/市值中性化、费率表、缓冲、陈旧价格策略等），必须逐项核对。
+- v1.4 配置新增 `data.regime_index`；升级时必须确认它是价格指数，并与全收益 `benchmark_index` 分离。
 
 ## 5. 何时必须提问或上报
 

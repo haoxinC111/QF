@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -14,7 +15,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ashare_quant.backtest import Backtester, Lot, Position
 from ashare_quant.config import AppConfig
-from ashare_quant.data import ACTION_COLUMNS, TushareDownloader, make_demo_bundle
+from ashare_quant.data import (
+    ACTION_COLUMNS,
+    CACHE_SCHEMA_VERSION,
+    MarketDataBundle,
+    TushareDownloader,
+    make_demo_bundle,
+)
 from ashare_quant.factors import (
     MultiFactorStrategy,
     _capped_allocation,
@@ -29,6 +36,11 @@ from ashare_quant.research import (
     run_cost_stress,
     run_factor_ablation,
     run_rolling_oos,
+)
+from ashare_quant.provenance import (
+    build_file_inventory,
+    inventory_sha256,
+    record_experiment,
 )
 
 
@@ -77,6 +89,19 @@ class AllocationAndConfigTests(unittest.TestCase):
         self.assertEqual(execution.fee_on("2023-08-27").stamp_duty_sell, 0.001)
         self.assertEqual(execution.fee_on("2023-08-28").stamp_duty_sell, 0.0005)
 
+    def test_total_return_benchmark_cannot_be_regime_index(self) -> None:
+        base = AppConfig()
+        invalid = replace(
+            base,
+            data=replace(
+                base.data,
+                regime_index=base.data.benchmark_index,
+                benchmark_is_total_return=True,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "不能同时作为"):
+            invalid.validate()
+
     def test_lot_ledger_enforces_t_plus_one(self) -> None:
         position = Position()
         day_one = pd.Timestamp("2024-01-02")
@@ -85,6 +110,38 @@ class AllocationAndConfigTests(unittest.TestCase):
         self.assertEqual(position.sellable_shares(day_one), 0)
         self.assertEqual(position.remove_sellable(100, day_one), 0)
         self.assertEqual(position.remove_sellable(100, day_two), 100)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def test_experiment_registry_is_idempotent_and_refuses_corruption(self) -> None:
+        reproducibility = {
+            "run_fingerprint_sha256": "run-001",
+            "created_at_utc": "2026-07-13T00:00:00+00:00",
+            "config": {"sha256": "config-001"},
+            "source": {"sha256": "source-001"},
+            "git": {"commit": "abc123", "dirty": False},
+            "data": {"data_fingerprint_sha256": "data-001"},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "experiments.jsonl"
+            for _ in range(2):
+                record_experiment(
+                    registry,
+                    reproducibility,
+                    experiment_type="unit_test",
+                    protocol={"untouched_holdout_certified": False},
+                    artifacts=["metrics.json"],
+                )
+            self.assertEqual(len(registry.read_text().splitlines()), 1)
+            registry.write_text("not-json\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "拒绝覆盖"):
+                record_experiment(
+                    registry,
+                    {**reproducibility, "run_fingerprint_sha256": "run-002"},
+                    experiment_type="unit_test",
+                    protocol={},
+                    artifacts=[],
+                )
 
 
 class DataValidationTests(unittest.TestCase):
@@ -112,6 +169,22 @@ class DataValidationTests(unittest.TestCase):
         bundle.benchmark = bundle.benchmark.drop(bundle.benchmark.index[100])
         with self.assertRaisesRegex(ValueError, "基准行情缺少"):
             bundle.prepare()
+
+    def test_regime_gap_is_rejected(self) -> None:
+        bundle = make_demo_bundle(seed=14, start="2016-01-04", end="2018-12-31", symbols=25)
+        bundle.regime = bundle.regime.drop(bundle.regime.index[100])
+        with self.assertRaisesRegex(ValueError, "择时指数行情缺少"):
+            bundle.prepare()
+
+    def test_regime_signal_does_not_use_performance_benchmark(self) -> None:
+        bundle = make_demo_bundle(seed=15, start="2016-01-04", end="2018-12-31", symbols=25)
+        bundle.benchmark["close"] = np.linspace(100.0, 300.0, len(bundle.benchmark))
+        bundle.regime["close"] = np.linspace(300.0, 100.0, len(bundle.regime))
+        prepared = bundle.prepare()
+        strategy = MultiFactorStrategy(prepared, AppConfig().strategy)
+        regime, exposure = strategy._regime_at(prepared.calendar[-1])
+        self.assertEqual(regime, "RISK_OFF")
+        self.assertEqual(exposure, AppConfig().strategy.risk_off_exposure)
 
     def test_membership_snapshot_gap_is_rejected(self) -> None:
         bundle = make_demo_bundle(seed=5, start="2016-01-04", end="2018-12-31", symbols=25)
@@ -150,7 +223,7 @@ class DataValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "未覆盖"):
             bundle.prepare()
 
-    def test_v2_bar_cache_is_not_reused_as_v3(self) -> None:
+    def test_legacy_bar_without_size_data_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "600000_SH.csv.gz"
             pd.DataFrame({"date": ["2018-01-02", "2018-01-03"]}).to_csv(
@@ -167,6 +240,69 @@ class DataValidationTests(unittest.TestCase):
                 membership,
             )
             self.assertFalse(usable)
+
+    def test_strict_cache_fingerprint_detects_tampering_before_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [
+                root / "membership.csv.gz",
+                root / "benchmark.csv.gz",
+                root / "regime.csv.gz",
+                root / "corporate_actions.csv.gz",
+                root / "securities.csv.gz",
+                root / "industry_membership.csv.gz",
+                root / "calendar.csv.gz",
+                root / "bars" / "600000_SH.csv.gz",
+            ]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(f"sealed-{path.name}".encode())
+            files = build_file_inventory(root, paths)
+            base = AppConfig()
+            (root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": CACHE_SCHEMA_VERSION,
+                        "provider": base.data.provider,
+                        "universe_index": base.data.universe_index,
+                        "regime_index": base.data.regime_index,
+                        "benchmark_index": base.data.benchmark_index,
+                        "industry_standard": base.data.industry_standard,
+                        "industry_level": base.data.industry_level,
+                        "requested_start": "2016-01-01",
+                        "requested_end": "2025-12-31",
+                        "files": files,
+                        "data_fingerprint_sha256": inventory_sha256(files),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "身份与当前配置不匹配"):
+                MarketDataBundle.from_cache(
+                    root,
+                    strict=False,
+                    expected_config=replace(
+                        base,
+                        data=replace(base.data, universe_index="000905.SH"),
+                    ),
+                )
+            with self.assertRaisesRegex(ValueError, "缓存日期范围不足"):
+                MarketDataBundle.from_cache(
+                    root,
+                    strict=False,
+                    expected_config=replace(
+                        base,
+                        backtest=replace(base.backtest, end_date="2026-12-31"),
+                    ),
+                )
+            paths[-1].write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "完整性校验失败"):
+                MarketDataBundle.from_cache(root, strict=False)
+            paths[-1].write_bytes(f"sealed-{paths[-1].name}".encode())
+            extra = root / "bars" / "600001_SH.csv.gz"
+            extra.write_bytes(b"unsealed-extra")
+            with self.assertRaisesRegex(ValueError, "文件集合不一致"):
+                MarketDataBundle.from_cache(root, strict=False)
 
 
 class EndToEndTests(unittest.TestCase):
@@ -349,6 +485,20 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("matched_benchmark_cagr", metrics)
         self.assertIn("benchmark_max_drawdown", metrics)
         self.assertIsNotNone(metrics["matched_benchmark_cagr"])
+
+    def test_deterministic_golden_metrics(self) -> None:
+        metrics = calculate_metrics(self.result, self.config)
+        self.assertAlmostEqual(float(metrics["final_nav"]), 870961.5596035972, places=4)
+        self.assertAlmostEqual(float(metrics["cagr"]), 0.04196309744833271, places=10)
+        self.assertAlmostEqual(
+            float(metrics["max_drawdown"]), -0.0908917222450416, places=10
+        )
+        self.assertAlmostEqual(float(metrics["sharpe"]), 0.4919462883545638, places=10)
+        self.assertAlmostEqual(
+            float(metrics["annual_turnover"]), 1.9195314006881268, places=10
+        )
+        self.assertAlmostEqual(float(metrics["total_fees"]), 5630.1728582604455, places=4)
+        self.assertEqual(int(metrics["filled_trade_count"]), 280)
 
     def test_exposure_tables_are_reported(self) -> None:
         industries = industry_exposure_table(self.result.selections)
