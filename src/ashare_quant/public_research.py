@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import random
+import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -33,6 +34,25 @@ BAR_COLUMNS = [
     "change",
     "turnover_pct",
 ]
+
+
+try:
+    from akshare.stock.cons import hk_js_decode
+except ImportError:  # pragma: no cover - optional dependency
+    hk_js_decode = None  # type: ignore[assignment]
+
+try:
+    from py_mini_racer import MiniRacer
+except ImportError:  # pragma: no cover - optional dependency
+    try:
+        from py_mini_racer import py_mini_racer as _py_mini_racer
+
+        MiniRacer = _py_mini_racer.MiniRacer  # type: ignore[misc]
+    except ImportError:
+        MiniRacer = None  # type: ignore[misc,assignment]
+
+_MINIRACER_THREAD_LOCAL: threading.local = threading.local()
+_MINIRACER_INIT_LOCK: threading.Lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -203,6 +223,28 @@ def _request_bars(
     raise RuntimeError(f"下载 {symbol} 失败，已重试 {retries} 次: {last_error}")
 
 
+def _get_sina_js_runtime() -> object:
+    """Return a thread-local MiniRacer runtime with the Sina decode function loaded.
+
+    MiniRacer/V8 does not tolerate concurrent initialization across threads, so the
+    first creation in each thread is serialized with a process-wide lock. The runtime
+    is then reused for every subsequent call on that thread.
+    """
+    if hk_js_decode is None or MiniRacer is None:
+        raise RuntimeError(
+            "新浪公开源需要可选依赖，请先运行 pip install 'akshare>=1.18,<2'"
+        )
+    runtime = getattr(_MINIRACER_THREAD_LOCAL, "runtime", None)
+    if runtime is None:
+        with _MINIRACER_INIT_LOCK:
+            runtime = getattr(_MINIRACER_THREAD_LOCAL, "runtime", None)
+            if runtime is None:
+                runtime = MiniRacer()
+                runtime.eval(hk_js_decode)
+                _MINIRACER_THREAD_LOCAL.runtime = runtime
+    return runtime
+
+
 def _request_sina_bars(
     symbol: str,
     start_date: str,
@@ -213,14 +255,6 @@ def _request_sina_bars(
     pause: float,
 ) -> pd.DataFrame:
     """Fetch the compact Sina history blob and apply its point-in-date HFQ factors."""
-    try:
-        from akshare.stock.cons import hk_js_decode
-        from py_mini_racer import py_mini_racer
-    except ImportError as exc:
-        raise RuntimeError(
-            "新浪公开源需要可选依赖，请先运行 pip install 'akshare>=1.18,<2'"
-        ) from exc
-
     sina_symbol = symbol.lower()
     history_url = (
         "https://finance.sina.com.cn/realstock/company/"
@@ -237,8 +271,7 @@ def _request_sina_bars(
             response = requests.get(history_url, headers=headers, timeout=timeout)
             response.raise_for_status()
             encoded = response.text.split("=", maxsplit=1)[1].split(";", maxsplit=1)[0]
-            runtime = py_mini_racer.MiniRacer()
-            runtime.eval(hk_js_decode)
+            runtime = _get_sina_js_runtime()
             decoded = runtime.call("d", encoded.replace('"', ""))
             frame = pd.DataFrame(decoded)
             if frame.empty:
