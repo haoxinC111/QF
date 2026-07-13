@@ -1,0 +1,6 @@
+{
+  "python": "3.12.13 (main, Mar  3 2026, 14:59:34) [Clang 21.1.4 ]",
+  "platform": "Linux-6.12.47-x86_64-with-glibc2.39",
+  "pandas": "2.2.3",
+  "numpy": "2.3.5"
+}

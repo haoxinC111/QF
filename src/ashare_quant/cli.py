@@ -11,6 +11,13 @@ from .config import AppConfig, BacktestConfig
 from .data import MarketDataBundle, TushareDownloader, make_demo_bundle
 from .report import console_summary, write_report
 from .research import write_research_suite
+from .public_research import (
+    PublicDownloadConfig,
+    PublicStrategyConfig,
+    download_public_history,
+    write_public_research,
+    write_public_robustness,
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -47,6 +54,35 @@ def _parser() -> argparse.ArgumentParser:
     demo = subparsers.add_parser("demo", help="无需 Token 的离线端到端演示")
     demo.add_argument("--output", default="results/demo", help="演示报告输出目录")
     demo.add_argument("--seed", type=int, default=7)
+
+    public_download = subparsers.add_parser(
+        "public-download", help="从公开 HTTPS 接口下载历史沪深300成分日线"
+    )
+    public_download.add_argument("--membership", required=True, help="csi300.csv 历史成分文件")
+    public_download.add_argument("--cache", default="data/public_eastmoney")
+    public_download.add_argument("--start", default="2012-01-01")
+    public_download.add_argument("--end", default="2025-12-31")
+    public_download.add_argument("--workers", type=int, default=6)
+    public_download.add_argument("--source", choices=["sina", "eastmoney"], default="sina")
+    public_download.add_argument("--force", action="store_true")
+
+    public_research = subparsers.add_parser(
+        "public-research", help="在公开历史成分与行情上运行分期研究"
+    )
+    public_research.add_argument("--membership", required=True, help="csi300.csv 历史成分文件")
+    public_research.add_argument("--cache", default="data/public_eastmoney")
+    public_research.add_argument("--output", default="results/public_research")
+    public_research.add_argument("--start", default="2013-01-01")
+    public_research.add_argument("--end", default="2025-12-31")
+
+    public_robustness = subparsers.add_parser(
+        "public-robustness", help="对公开数据动量候选运行成本压力与因子消融"
+    )
+    public_robustness.add_argument("--membership", required=True, help="csi300.csv 历史成分文件")
+    public_robustness.add_argument("--cache", default="data/public_eastmoney")
+    public_robustness.add_argument("--output", default="results/public_research/robustness")
+    public_robustness.add_argument("--start", default="2013-01-01")
+    public_robustness.add_argument("--end", default="2025-12-31")
     return parser
 
 
@@ -86,6 +122,48 @@ def _dispatch(args: argparse.Namespace) -> int:
             execution=config.execution,
         )
         _run_backtest(make_demo_bundle(seed=args.seed), config)
+        return 0
+
+    if args.command == "public-download":
+        manifest = download_public_history(
+            args.membership,
+            args.cache,
+            PublicDownloadConfig(
+                start_date=args.start,
+                end_date=args.end,
+                source=args.source,
+                workers=args.workers,
+            ),
+            force=args.force,
+        )
+        print(
+            f"公开数据完成: {manifest['available_count']}/{manifest['requested_count']} 个代码，"
+            f"失败 {len(manifest['failed'])} 个"
+        )
+        return 0
+
+    if args.command == "public-research":
+        written = write_public_research(
+            args.membership,
+            args.cache,
+            args.output,
+            PublicStrategyConfig(start_date=args.start, end_date=args.end),
+        )
+        print("公开数据研究完成:")
+        for name, path in written.items():
+            print(f"  {name}: {path}")
+        return 0
+
+    if args.command == "public-robustness":
+        written = write_public_robustness(
+            args.membership,
+            args.cache,
+            args.output,
+            PublicStrategyConfig(start_date=args.start, end_date=args.end),
+        )
+        print("公开数据稳健性检查完成:")
+        for name, path in written.items():
+            print(f"  {name}: {path}")
         return 0
 
     config = _load_config(args.config)
