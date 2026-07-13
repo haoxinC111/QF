@@ -123,7 +123,13 @@ python run.py public-research --membership csi300.csv --cache data/public_eastmo
 python -m unittest discover tests
 ```
 
-## 9. 本文件维护
+## 9. 已知问题（v1.4 本地复现后发现）
+
+- `uv.lock` 当前使用 PyPI 源生成。若本地默认 mirror 不是 PyPI（如 `UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple`），`uv sync --locked --extra public` 会报锁文件需要更新。 workaround：用 `UV_INDEX_URL=https://pypi.org/simple uv sync --locked --extra public`，或先 `uv sync --extra public`（但会改写锁文件）。
+- v1.4 压缩包里的 `results/public_research/` 是旧构建产物：周期名称为 `oos_2022_2025`/`full_2013_2025`，与源码里的 `historical_holdout_seen_2022_2025`/`full_requested_period` 不一致；数值也与本地用当前源码复现的结果有差异。应以本地最新源码运行结果为准。
+- issue #1（mini-racer 并发初始化 SIGTRAP）的临时修复已合并进 v1.4：依赖已锁入 `uv.lock`，并新增缓存指纹/停牌锁仓测试。但 V8 运行时仍缺少显式 `close()`/生命周期管理和多 worker 并发初始化测试。
+
+## 10. 本文件维护
 
 - 每次项目出现新的“本地管理问题”或“复现陷阱”时，更新本文件。
 - 不要把策略逻辑、因子公式写进本文件，那些属于代码和 README。
