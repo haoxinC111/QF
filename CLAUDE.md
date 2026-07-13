@@ -20,6 +20,7 @@
   - `v1.2.0`：严格通道升级（行业/市值中性化、股份账本、研究套件）
   - `v1.3.0`：新增公开数据源研究通道（新浪财经/东方财富）
   - `v1.4.0`：修复公开停牌锁仓缩放，分离择时/业绩基准，加入数据与运行指纹
+  - `v1.4.1`：清理旧结果产物，加入输出 SHA256、结果校验和运行模块来源
 
 ## 3. ZIP 处理标准流程
 
@@ -36,7 +37,7 @@
    - 配置：`config.example.yaml`、`pyproject.toml`、`requirements*.txt`
    - 文档：`README.md`、`V1.*_VALIDATION.md`、`PUBLIC_SOURCE_AUDIT.md`
    - 测试：`tests/`
-   - 结果：`results/`（压缩包里通常包含，但 `.gitignore` 默认忽略，需要时强制加入）
+   - 结果：`results/`（生成物不进入源码包；需要发布时作为绑定数据指纹的独立 Release 附件）
 4. **确认用户意图**后再合并到当前项目，不要自动覆盖工作目录。
 5. **写入 Git 历史**：每次版本升级应为一个独立 commit，commit message 写明版本号和核心变化。
 
@@ -125,8 +126,8 @@ python -m unittest discover tests
 
 ## 9. 已知问题（v1.4 本地复现后发现）
 
-- `uv.lock` 当前使用 PyPI 源生成。若本地默认 mirror 不是 PyPI（如 `UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple`），`uv sync --locked --extra public` 会报锁文件需要更新。 workaround：用 `UV_INDEX_URL=https://pypi.org/simple uv sync --locked --extra public`，或先 `uv sync --extra public`（但会改写锁文件）。
-- v1.4 压缩包里的 `results/public_research/` 是旧构建产物：周期名称为 `oos_2022_2025`/`full_2013_2025`，与源码里的 `historical_holdout_seen_2022_2025`/`full_requested_period` 不一致；数值也与本地用当前源码复现的结果有差异。应以本地最新源码运行结果为准。
+- `uv.lock` 使用 PyPI 源生成。若本地默认 mirror 不是 PyPI（如 `UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple`），使用 `uv sync --locked --extra public --default-index https://pypi.org/simple`。不要用已弃用的 `UV_INDEX_URL` 覆盖，也不要为了同步而去掉 `--locked`。
+- v1.4.0 压缩包里的 `results/public_research/` 是旧构建产物；v1.4.1 已停止追踪整个 `results/`。本地新结果只能作为绑定完整数据指纹的参考结果，源码包和 GitHub tag 不再携带生成结果。
 - issue #1（mini-racer 并发初始化 SIGTRAP）的临时修复已合并进 v1.4：依赖已锁入 `uv.lock`，并新增缓存指纹/停牌锁仓测试。但 V8 运行时仍缺少显式 `close()`/生命周期管理和多 worker 并发初始化测试。
 
 ## 10. 本文件维护

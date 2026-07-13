@@ -19,6 +19,7 @@ from .config import AppConfig
 from .provenance import (
     build_reproducibility_manifest,
     record_experiment,
+    write_artifact_manifest,
     write_json_atomic,
 )
 
@@ -481,7 +482,26 @@ def write_report(
     (output / "report.html").write_text(
         _html_report(result, config, metrics, image), encoding="utf-8"
     )
-    record_experiment(
+    artifact_paths = [
+        output / name
+        for name in [
+            "equity_curve.csv",
+            "trades.csv",
+            "orders.csv",
+            "selections.csv",
+            "industry_exposure.csv",
+            "style_exposure.csv",
+            "corporate_events.csv",
+            "final_positions.json",
+            "metrics.json",
+            "resolved_config.yaml",
+            "runtime.json",
+            "reproducibility.json",
+            "performance.png",
+            "report.html",
+        ]
+    ]
+    registry_path = record_experiment(
         output / "experiment_registry.jsonl",
         reproducibility,
         experiment_type=experiment_type,
@@ -491,13 +511,9 @@ def write_report(
             "run_context": dict(run_context or {}),
             "note": "代码记录运行身份，但是否在看过区间结果后调参必须由研究者披露。",
         },
-        artifacts=[
-            output / "metrics.json",
-            output / "equity_curve.csv",
-            output / "reproducibility.json",
-            output / "report.html",
-        ],
+        artifacts=artifact_paths,
     )
+    write_artifact_manifest(output, [*artifact_paths, registry_path])
     return metrics
 
 

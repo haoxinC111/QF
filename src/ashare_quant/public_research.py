@@ -24,6 +24,7 @@ from .provenance import (
     inventory_sha256,
     record_experiment,
     verify_file_inventory,
+    write_artifact_manifest,
     write_json_atomic,
 )
 
@@ -1260,6 +1261,7 @@ def write_public_research(
     )
     metric_rows: list[dict[str, object]] = []
     results: dict[str, PublicBacktestResult] = {}
+    variant_artifacts: list[Path] = []
     periods = {
         "development_2013_2017": ("2013-01-01", "2017-12-31"),
         "validation_2018_2021": ("2018-01-01", "2021-12-31"),
@@ -1280,6 +1282,16 @@ def write_public_research(
         )
         (variant_dir / "data_quality.json").write_text(
             json.dumps(result.data_quality, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        variant_artifacts.extend(
+            variant_dir / name
+            for name in [
+                "equity_curve.csv",
+                "selections.csv",
+                "rebalances.csv",
+                "config.json",
+                "data_quality.json",
+            ]
         )
         for period, (start, end) in periods.items():
             strategy_metrics = _slice_metrics(result.equity_curve, start, end, "nav")
@@ -1431,7 +1443,26 @@ def write_public_research(
             "prospective_holdout_start": "2026-01-01",
             "untouched_holdout_certified": False,
         },
-        artifacts=[report_path, metrics_path, chart_path, manifest_path, reproducibility_path],
+        artifacts=[
+            report_path,
+            metrics_path,
+            chart_path,
+            manifest_path,
+            reproducibility_path,
+            *variant_artifacts,
+        ],
+    )
+    artifact_manifest_path = write_artifact_manifest(
+        output_dir,
+        [
+            report_path,
+            metrics_path,
+            chart_path,
+            manifest_path,
+            reproducibility_path,
+            *variant_artifacts,
+            registry_path,
+        ],
     )
     return {
         "report": report_path,
@@ -1440,6 +1471,7 @@ def write_public_research(
         "manifest": manifest_path,
         "reproducibility": reproducibility_path,
         "registry": registry_path,
+        "artifacts": artifact_manifest_path,
         "output_dir": output_dir,
     }
 
@@ -1570,10 +1602,21 @@ def write_public_robustness(
         },
         artifacts=[report_path, cost_path, ablation_path, reproducibility_path],
     )
+    artifact_manifest_path = write_artifact_manifest(
+        output_dir,
+        [
+            report_path,
+            cost_path,
+            ablation_path,
+            reproducibility_path,
+            registry_path,
+        ],
+    )
     return {
         "report": report_path,
         "cost": cost_path,
         "ablation": ablation_path,
         "reproducibility": reproducibility_path,
         "registry": registry_path,
+        "artifacts": artifact_manifest_path,
     }

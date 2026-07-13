@@ -1,6 +1,6 @@
 # A股动态股票池多因子量化回测
 
-这是一个研究/回测级的 Python 项目。v1.4 在 v1.3 公开数据研究通道和 Tushare 严格账本回测之上，重点补强结果可信度：停牌持仓不再被资金缩放逻辑隐式卖出；价格择时指数与全收益业绩基准彻底分离；严格缓存、公开缓存、历史成分、配置、源码和运行环境都写入 SHA256 可复现清单。严格通道仍显式建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、滑点和成交容量。
+这是一个研究/回测级的 Python 项目。v1.4.1 在 v1.4 结果可信度改造上补齐生成结果的逐文件 SHA256、结果校验命令和 MiniRacer 实际运行模块记录，并停止把生成结果混入源码包。严格通道仍显式建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、滑点和成交容量。
 
 > 重要：本项目不构成投资建议，不承诺收益，也没有连接券商下单。先用离线演示确认环境，再用自己的数据权限回测；任何真实资金使用前，都应做样本外检验、压力测试、人工复核和小资金仿真。
 
@@ -107,7 +107,11 @@ results/demo/report.html
 
 ### 2. 用公开数据复现实证回测（无需 Token）
 
-公开通道使用第三方项目根据中证指数官方公告整理的历史成分区间，并通过公开 HTTPS 行情接口下载日线和后复权因子。使用 uv 时执行 `uv sync --locked --extra public`；使用 pip 时按下面安装额外依赖并取得历史成分文件：
+公开通道使用第三方项目根据中证指数官方公告整理的历史成分区间，并通过公开 HTTPS 行情接口下载日线和后复权因子。使用 uv 时执行下面的锁定命令；显式指定 PyPI 可以避免本机 `UV_DEFAULT_INDEX` 镜像设置要求改写锁文件。使用 pip 时按后文安装额外依赖并取得历史成分文件：
+
+```bash
+uv sync --locked --extra public --default-index https://pypi.org/simple
+```
 
 ```bash
 pip install -r requirements-public.txt
@@ -228,7 +232,8 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 | `resolved_config.yaml` | 本次运行的完整配置快照 |
 | `runtime.json` | Python、NumPy、pandas 和系统版本 |
 | `reproducibility.json` | 配置、源码、Git、依赖、数据清单和本次运行的组合指纹 |
-| `experiment_registry.jsonl` | 按运行指纹登记的实验协议与核心产物，重复运行不重复写入 |
+| `experiment_registry.jsonl` | 按运行指纹登记实验协议及每个产物的大小和 SHA256 |
+| `artifact_manifest.json` | 本次输出文件集合、逐文件 SHA256 和集合指纹 |
 
 `research` 命令默认在 `results/latest/research/` 生成：
 
@@ -240,6 +245,7 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 | `research_manifest.json` | 本次研究模式、压力参数和窗口参数 |
 | `reproducibility.json` | 研究配置、代码和数据的完整可复现身份 |
 | `experiment_registry.jsonl` | 固定参数研究协议和实验身份登记 |
+| `artifact_manifest.json` | 研究输出的逐文件 SHA256 和集合指纹 |
 
 `public-research` 命令默认在 `results/public_research/` 生成：
 
@@ -249,12 +255,23 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 | `research_manifest.json` | 数据路径、区间状态、策略参数和公开数据局限 |
 | `reproducibility.json` | 历史成分、行情缓存、代码、依赖与策略参数指纹 |
 | `experiment_registry.jsonl` | 明确记录 2022–2025 已查看状态的实验登记 |
+| `artifact_manifest.json` | 报告、图表、指标和全部策略明细的逐文件 SHA256 |
 | `<strategy>/equity_curve.csv` | 策略与沪深300ETF后复权基准净值 |
 | `<strategy>/selections.csv` | 月末截面因子、排名、缓冲原因与目标权重 |
 | `<strategy>/rebalances.csv` | 次日开盘调仓、双边换手与成本 |
 | `<strategy>/data_quality.json` | 历史成员覆盖、缺失成交和已知限制 |
 | `robustness/cost_stress.csv` | 动量候选在 5/10/20 bps 单边滑点下的全区间与已查看历史保留期结果 |
 | `robustness/factor_ablation.csv` | 逐一删除动量、趋势和低波因子的同口径结果 |
+
+每次生成结果后可校验所有已封存文件：
+
+```bash
+python run.py result-verify --output results/demo --strict
+python run.py result-verify --output results/public_research
+python run.py result-verify --output results/public_research/robustness --strict
+```
+
+第二条未使用 `--strict`，是因为公开研究目录允许随后增加独立封存的 `robustness/` 子目录。公开数据会被上游修订；研究结果必须与 `reproducibility.json` 中的数据指纹共同归档，不能仅凭重新下载的数据宣称严格复现。
 
 ## 五、核心参数怎么调
 

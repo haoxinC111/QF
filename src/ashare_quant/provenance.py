@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import platform
 import subprocess
@@ -11,7 +12,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
-REPRODUCIBILITY_SCHEMA_VERSION = 1
+REPRODUCIBILITY_SCHEMA_VERSION = 2
+ARTIFACT_MANIFEST_SCHEMA_VERSION = 1
+ARTIFACT_MANIFEST_FILENAME = "artifact_manifest.json"
 DEPENDENCY_DISTRIBUTIONS = (
     "numpy",
     "pandas",
@@ -20,8 +23,11 @@ DEPENDENCY_DISTRIBUTIONS = (
     "requests",
     "tushare",
     "akshare",
+    "akracer",
+    "mini-racer",
     "py-mini-racer",
 )
+RUNTIME_MODULES = ("py_mini_racer",)
 
 
 def _canonical_bytes(payload: Any) -> bytes:
@@ -193,6 +199,26 @@ def _dependency_versions() -> dict[str, str | None]:
     return versions
 
 
+def _runtime_module_provenance() -> dict[str, dict[str, Any]]:
+    """Identify importable runtime modules, including shared namespace providers."""
+    package_providers = metadata.packages_distributions()
+    modules: dict[str, dict[str, Any]] = {}
+    for module_name in RUNTIME_MODULES:
+        providers = sorted(package_providers.get(module_name, []))
+        try:
+            spec = importlib.util.find_spec(module_name)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            spec = None
+        origin = Path(spec.origin).resolve() if spec and spec.origin else None
+        modules[module_name] = {
+            "available": bool(origin and origin.is_file()),
+            "providers": providers,
+            "origin": str(origin) if origin else None,
+            "sha256": sha256_file(origin) if origin and origin.is_file() else None,
+        }
+    return modules
+
+
 def build_reproducibility_manifest(
     config_payload: Mapping[str, Any],
     *,
@@ -204,6 +230,7 @@ def build_reproducibility_manifest(
     source = _source_fingerprint(root)
     git = _git_metadata(root)
     dependencies = _dependency_versions()
+    runtime_modules = _runtime_module_provenance()
     config = dict(config_payload)
 
     data: dict[str, Any] = {
@@ -235,6 +262,14 @@ def build_reproducibility_manifest(
         "data_fingerprint_sha256": data["data_fingerprint_sha256"],
         "extra_inputs_sha256": inventory_sha256(inputs) if inputs else None,
         "dependencies": dependencies,
+        "runtime_modules": {
+            name: {
+                "available": details["available"],
+                "providers": details["providers"],
+                "sha256": details["sha256"],
+            }
+            for name, details in runtime_modules.items()
+        },
         "python": platform.python_version(),
     }
     return {
@@ -251,6 +286,7 @@ def build_reproducibility_manifest(
             "executable": sys.executable,
             "platform": platform.platform(),
             "dependencies": dependencies,
+            "modules": runtime_modules,
         },
     }
 
@@ -266,6 +302,89 @@ def write_json_atomic(payload: Mapping[str, Any], path: str | Path) -> Path:
     return target
 
 
+def build_artifact_inventory(
+    root: str | Path,
+    artifacts: Iterable[str | Path],
+) -> list[dict[str, Any]]:
+    """Fingerprint result files relative to their output directory."""
+    base = Path(root).resolve()
+    resolved: set[Path] = set()
+    for value in artifacts:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        candidate = candidate.resolve()
+        if candidate == base or base not in candidate.parents:
+            raise ValueError(f"结果文件不在输出目录内: {candidate}")
+        if not candidate.is_file():
+            raise FileNotFoundError(f"结果文件不存在: {candidate}")
+        resolved.add(candidate)
+    return [file_fingerprint(path, root=base) for path in sorted(resolved)]
+
+
+def write_artifact_manifest(
+    root: str | Path,
+    artifacts: Iterable[str | Path],
+    *,
+    filename: str = ARTIFACT_MANIFEST_FILENAME,
+) -> Path:
+    """Seal generated result files; the manifest intentionally excludes itself."""
+    base = Path(root).resolve()
+    target = base / filename
+    files = build_artifact_inventory(base, artifacts)
+    payload = {
+        "schema_version": ARTIFACT_MANIFEST_SCHEMA_VERSION,
+        "created_at_utc": datetime.now(UTC).isoformat(),
+        "files": files,
+        "artifact_set_sha256": inventory_sha256(files),
+    }
+    return write_json_atomic(payload, target)
+
+
+def verify_artifact_manifest(
+    manifest_path: str | Path,
+    *,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Verify every sealed result byte and optionally reject unsealed files."""
+    target = Path(manifest_path).resolve()
+    if not target.is_file():
+        raise FileNotFoundError(f"缺少结果指纹清单: {target}")
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"结果指纹清单不是有效 JSON: {target}") from exc
+    if payload.get("schema_version") != ARTIFACT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            f"不支持的结果指纹版本: {payload.get('schema_version')!r}"
+        )
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("结果指纹清单没有文件记录")
+    expected_set_hash = str(payload.get("artifact_set_sha256", ""))
+    actual_set_hash = inventory_sha256(files)
+    if expected_set_hash != actual_set_hash:
+        raise ValueError("结果指纹清单自身的集合 SHA256 不匹配")
+    verification = verify_file_inventory(target.parent, files)
+    sealed_paths = {str(item["path"]) for item in files}
+    actual_paths = {
+        path.relative_to(target.parent).as_posix()
+        for path in target.parent.rglob("*")
+        if path.is_file() and path != target
+    }
+    unsealed_paths = sorted(actual_paths - sealed_paths)
+    if strict and unsealed_paths:
+        raise ValueError(
+            "结果目录包含未封存文件: " + ", ".join(unsealed_paths[:10])
+        )
+    return {
+        **verification,
+        "artifact_set_sha256": actual_set_hash,
+        "unsealed_paths": unsealed_paths,
+        "strict": strict,
+    }
+
+
 def record_experiment(
     registry_path: str | Path,
     reproducibility: Mapping[str, Any],
@@ -278,6 +397,7 @@ def record_experiment(
     target = Path(registry_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     experiment_id = str(reproducibility["run_fingerprint_sha256"])
+    artifact_files = build_artifact_inventory(target.parent, artifacts)
     record = {
         "experiment_id": experiment_id,
         "created_at_utc": reproducibility.get("created_at_utc"),
@@ -290,7 +410,7 @@ def record_experiment(
         "data_fingerprint_sha256": reproducibility["data"][
             "data_fingerprint_sha256"
         ],
-        "artifacts": sorted(Path(path).name for path in artifacts),
+        "artifacts": artifact_files,
     }
     existing: list[dict[str, Any]] = []
     if target.is_file():
@@ -308,11 +428,22 @@ def record_experiment(
             if not isinstance(parsed, dict):
                 raise ValueError(f"实验登记表第 {number} 行不是对象结构")
             existing.append(parsed)
-    if any(item.get("experiment_id") == experiment_id for item in existing):
-        return target
+    matching_index = next(
+        (
+            index
+            for index, item in enumerate(existing)
+            if item.get("experiment_id") == experiment_id
+        ),
+        None,
+    )
+    if matching_index is not None:
+        # Output directories are overwritten on a rerun. Keep the registry entry for
+        # this reproducible identity aligned with the bytes that now exist on disk.
+        existing[matching_index] = record
     temporary = target.with_name(target.name + ".tmp")
     lines = [json.dumps(item, ensure_ascii=False, sort_keys=True) for item in existing]
-    lines.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
+    if matching_index is None:
+        lines.append(json.dumps(record, ensure_ascii=False, sort_keys=True))
     temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
     temporary.replace(target)
     return target

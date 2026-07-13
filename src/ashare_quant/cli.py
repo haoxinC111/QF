@@ -11,6 +11,7 @@ from .config import AppConfig, BacktestConfig
 from .data import MarketDataBundle, TushareDownloader, make_demo_bundle
 from .report import console_summary, write_report
 from .research import write_research_suite
+from .provenance import ARTIFACT_MANIFEST_FILENAME, verify_artifact_manifest
 from .public_research import (
     PublicDownloadConfig,
     PublicStrategyConfig,
@@ -94,6 +95,16 @@ def _parser() -> argparse.ArgumentParser:
         "--seal-legacy",
         action="store_true",
         help="为 v1.3 旧缓存首次生成 v1.4 指纹，不重新下载行情",
+    )
+
+    result_verify = subparsers.add_parser(
+        "result-verify", help="验证回测或研究输出的 SHA256 指纹"
+    )
+    result_verify.add_argument("--output", required=True, help="结果输出目录")
+    result_verify.add_argument(
+        "--strict",
+        action="store_true",
+        help="同时拒绝 artifact_manifest.json 未登记的额外文件",
     )
     return parser
 
@@ -205,6 +216,16 @@ def _dispatch(args: argparse.Namespace) -> int:
             f"公开缓存校验通过: {manifest.get('available_count', 0)} 个文件，"
             f"指纹 {manifest.get('data_fingerprint_sha256', '')}，"
             f"状态 {verification.get('verified', True)}"
+        )
+        return 0
+
+    if args.command == "result-verify":
+        manifest_path = Path(args.output).resolve() / ARTIFACT_MANIFEST_FILENAME
+        verification = verify_artifact_manifest(manifest_path, strict=args.strict)
+        print(
+            f"结果校验通过: {verification['file_count']} 个文件，"
+            f"集合指纹 {verification['artifact_set_sha256']}，"
+            f"未封存 {len(verification['unsealed_paths'])} 个"
         )
         return 0
 

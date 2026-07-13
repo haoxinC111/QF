@@ -38,9 +38,12 @@ from ashare_quant.research import (
     run_rolling_oos,
 )
 from ashare_quant.provenance import (
+    build_reproducibility_manifest,
     build_file_inventory,
     inventory_sha256,
     record_experiment,
+    verify_artifact_manifest,
+    write_artifact_manifest,
 )
 
 
@@ -124,6 +127,8 @@ class ProvenanceTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             registry = Path(directory) / "experiments.jsonl"
+            metrics = Path(directory) / "metrics.json"
+            metrics.write_text('{"cagr": 0.1}\n', encoding="utf-8")
             for _ in range(2):
                 record_experiment(
                     registry,
@@ -133,6 +138,9 @@ class ProvenanceTests(unittest.TestCase):
                     artifacts=["metrics.json"],
                 )
             self.assertEqual(len(registry.read_text().splitlines()), 1)
+            record = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(record["artifacts"][0]["path"], "metrics.json")
+            self.assertEqual(len(record["artifacts"][0]["sha256"]), 64)
             registry.write_text("not-json\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "拒绝覆盖"):
                 record_experiment(
@@ -142,6 +150,43 @@ class ProvenanceTests(unittest.TestCase):
                     protocol={},
                     artifacts=[],
                 )
+
+    def test_artifact_manifest_detects_tampering_and_unsealed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "metrics.json"
+            second = root / "nested" / "curve.csv"
+            second.parent.mkdir()
+            first.write_text('{"cagr": 0.1}\n', encoding="utf-8")
+            second.write_text("date,nav\n2025-01-01,1.0\n", encoding="utf-8")
+            manifest = write_artifact_manifest(root, [first, second])
+
+            verified = verify_artifact_manifest(manifest, strict=True)
+            self.assertTrue(verified["verified"])
+            self.assertEqual(verified["file_count"], 2)
+            self.assertEqual(verified["unsealed_paths"], [])
+
+            first.write_text('{"cagr": 0.2}\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "完整性校验失败"):
+                verify_artifact_manifest(manifest)
+            first.write_text('{"cagr": 0.1}\n', encoding="utf-8")
+            (root / "unsealed.txt").write_text("extra", encoding="utf-8")
+            self.assertEqual(
+                verify_artifact_manifest(manifest)["unsealed_paths"],
+                ["unsealed.txt"],
+            )
+            with self.assertRaisesRegex(ValueError, "未封存文件"):
+                verify_artifact_manifest(manifest, strict=True)
+
+    def test_reproducibility_records_racer_distributions_and_module_provider(self) -> None:
+        reproducibility = build_reproducibility_manifest({}, project_root=ROOT)
+        dependencies = reproducibility["runtime"]["dependencies"]
+        self.assertIn("akracer", dependencies)
+        self.assertIn("mini-racer", dependencies)
+        self.assertIn("py-mini-racer", dependencies)
+        module = reproducibility["runtime"]["modules"]["py_mini_racer"]
+        self.assertIn("providers", module)
+        self.assertIn("sha256", module)
 
 
 class DataValidationTests(unittest.TestCase):

@@ -14,6 +14,7 @@ from .report import calculate_metrics
 from .provenance import (
     build_reproducibility_manifest,
     record_experiment,
+    write_artifact_manifest,
     write_json_atomic,
 )
 
@@ -243,4 +244,6 @@ def write_research_suite(
         artifacts=[*written.values()],
     )
     written["registry"] = registry_path
+    artifact_manifest_path = write_artifact_manifest(output, written.values())
+    written["artifacts"] = artifact_manifest_path
     return written
