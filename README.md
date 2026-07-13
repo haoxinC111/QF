@@ -42,7 +42,7 @@ Score_i={}&0.25Z(MOM12\_1)+0.15Z(MOM6\_1)+0.25Z(FIPMom)\\
 \end{aligned}
 \]
 
-公式、冻结权重和晋级标准详见 [`V1.5_ALPHA.md`](V1.5_ALPHA.md)。2013–2025 已被旧版本研究查看，v1.5 历史回放不属于未触碰样本外；项目也不会为了达到指定年化收益而自动调参。
+公式、冻结权重和晋级标准详见 [`V1.5_ALPHA.md`](V1.5_ALPHA.md)，本次工程验收与公开数据阻塞记录见 [`V1.5_VALIDATION.md`](V1.5_VALIDATION.md)。2013–2025 已被旧版本研究查看，v1.5 历史回放不属于未触碰样本外；项目也不会为了达到指定年化收益而自动调参。
 
 原始综合分数形成后，程序以当日有效的行业哑变量和 `log(total_mv)` 做横截面最小二乘残差化；`size_neutralization_strength=1` 表示完整剔除线性市值暴露。这里的“中性”只针对选股分数，不意味着实际组合对所有风险因子严格零暴露，实际结果应查看 `style_exposure.csv`。
 
@@ -374,6 +374,7 @@ a_share_quant/
 ├── uv.lock            # 精确依赖锁
 ├── run.py
 ├── V1.5_ALPHA.md       # Alpha 公式、冻结权重和历史检验边界
+├── V1.5_VALIDATION.md  # 自动化验收、合成对照与公开数据续传状态
 ├── V1.4_TRUSTWORTHINESS.md
 ├── V1.2_VALIDATION.md  # 改造验收、合成对照和压力结果
 ├── src/ashare_quant/
