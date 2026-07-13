@@ -4,4 +4,4 @@ from .config import AppConfig
 from .data import MarketDataBundle
 
 __all__ = ["AppConfig", "MarketDataBundle"]
-__version__ = "1.4.2"
+__version__ = "1.5.0"

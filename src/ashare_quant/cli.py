@@ -39,13 +39,13 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--config", default="config.yaml", help="YAML 配置文件")
 
     research = subparsers.add_parser(
-        "research", help="运行因子消融、成本压力和滚动样本外评估"
+        "research", help="运行 Alpha 对照、因子消融、成本压力和滚动评估"
     )
     research.add_argument("--config", default="config.yaml", help="YAML 配置文件")
     research.add_argument(
         "--modes",
-        default="ablation,cost,rolling",
-        help="逗号分隔：ablation,cost,rolling",
+        default="alpha,ablation,cost,rolling",
+        help="逗号分隔：alpha,ablation,cost,rolling",
     )
     research.add_argument("--output", help="研究结果目录，默认在回测输出目录下")
     research.add_argument("--slippage-bps", default="5,10,20")
@@ -78,7 +78,7 @@ def _parser() -> argparse.ArgumentParser:
     public_research.add_argument("--end", default="2025-12-31")
 
     public_robustness = subparsers.add_parser(
-        "public-robustness", help="对公开数据动量候选运行成本压力与因子消融"
+        "public-robustness", help="对公开数据 v1.5 Alpha 运行成本压力与因子消融"
     )
     public_robustness.add_argument("--membership", required=True, help="csi300.csv 历史成分文件")
     public_robustness.add_argument("--cache", default="data/public_eastmoney")

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from .alpha import identify_alpha_profile
 from .backtest import BacktestResult
 from .config import AppConfig
 from .provenance import (
@@ -101,10 +102,16 @@ def style_exposure_table(selections: pd.DataFrame) -> pd.DataFrame:
         "z_size",
         "z_mom_12_1",
         "z_mom_6_1",
+        "z_fip_momentum",
         "z_trend",
         "z_low_vol",
+        "z_low_downside_vol",
+        "z_drawdown_quality",
         "z_liquidity",
+        "information_discreteness",
         "volatility",
+        "downside_volatility",
+        "drawdown_quality",
     ]
     columns = [
         "signal_date",
@@ -228,6 +235,7 @@ def calculate_metrics(result: BacktestResult, config: AppConfig) -> dict[str, An
     )
 
     return {
+        "alpha_profile": identify_alpha_profile(config.strategy.factor_weights),
         "start_date": str(pd.Timestamp(curve["date"].iloc[0]).date()),
         "end_date": str(pd.Timestamp(curve["date"].iloc[-1]).date()),
         "trading_days": int(len(curve)),

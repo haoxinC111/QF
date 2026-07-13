@@ -18,6 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import ashare_quant.public_research as public_module
+from ashare_quant.alpha import (
+    ALPHA_MODEL_VERSION,
+    FORMATION_RETURN_DAYS,
+    QUALITY_MOMENTUM_V1_5_WEIGHTS,
+)
 from ashare_quant.public_research import (
     MiniRacer,
     PublicDownloadConfig,
@@ -32,6 +37,7 @@ from ashare_quant.public_research import (
     download_public_history,
     load_membership,
     members_at,
+    public_strategy_variants,
     seal_public_cache,
     verify_public_cache,
 )
@@ -309,8 +315,108 @@ class PublicResearchTests(unittest.TestCase):
         changed = bars.copy()
         changed.loc[changed["date"] > signal_date, ["open", "close"]] *= 50.0
         recomputed = _build_features(changed, 60).set_index("date").loc[signal_date]
-        for column in ["mom_12_1", "mom_6_1", "trend", "volatility"]:
+        for column in [
+            "mom_12_1",
+            "mom_6_1",
+            "information_discreteness",
+            "fip_momentum",
+            "trend",
+            "volatility",
+            "downside_volatility",
+            "drawdown_quality",
+        ]:
             self.assertAlmostEqual(float(original[column]), float(recomputed[column]), places=12)
+
+    def test_fip_factor_rewards_gradual_winner_over_jump_winner(self) -> None:
+        target_gross_return = 1.30
+        prefix = [0.0] * 27
+        recent_month = [0.0] * 21
+        gradual_formation = [
+            target_gross_return ** (1.0 / FORMATION_RETURN_DAYS) - 1.0
+        ] * FORMATION_RETURN_DAYS
+        negative_return = -0.001
+        jump_return = target_gross_return / (
+            (1.0 + negative_return) ** (FORMATION_RETURN_DAYS - 1)
+        ) - 1.0
+        discrete_formation = [negative_return] * (FORMATION_RETURN_DAYS - 1) + [
+            jump_return
+        ]
+
+        def price_path(formation: list[float]) -> np.ndarray:
+            returns = np.asarray(prefix + formation + recent_month, dtype=float)
+            return 100.0 * np.r_[1.0, np.cumprod(1.0 + returns)]
+
+        dates = pd.bdate_range("2020-01-01", periods=280)
+        bars = pd.concat(
+            [
+                pd.DataFrame(
+                    {
+                        "date": dates,
+                        "symbol": symbol,
+                        "name": symbol,
+                        "open": values,
+                        "close": values,
+                        "amount": 100_000_000.0,
+                    }
+                )
+                for symbol, values in {
+                    "GRADUAL": price_path(gradual_formation),
+                    "DISCRETE": price_path(discrete_formation),
+                }.items()
+            ],
+            ignore_index=True,
+        )
+        latest = (
+            _build_features(bars, 60)
+            .sort_values("date")
+            .groupby("symbol", sort=False)
+            .tail(1)
+            .set_index("symbol")
+        )
+
+        self.assertAlmostEqual(
+            float(latest.at["GRADUAL", "mom_12_1"]),
+            float(latest.at["DISCRETE", "mom_12_1"]),
+            places=12,
+        )
+        self.assertAlmostEqual(
+            float(latest.at["GRADUAL", "information_discreteness"]),
+            -1.0,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            float(latest.at["DISCRETE", "information_discreteness"]),
+            (FORMATION_RETURN_DAYS - 2) / FORMATION_RETURN_DAYS,
+            places=12,
+        )
+        self.assertLess(
+            float(latest.at["GRADUAL", "information_discreteness"]),
+            float(latest.at["DISCRETE", "information_discreteness"]),
+        )
+        self.assertGreater(
+            float(latest.at["GRADUAL", "fip_momentum"]),
+            float(latest.at["DISCRETE", "fip_momentum"]),
+        )
+
+    def test_v1_5_public_candidate_uses_frozen_weights(self) -> None:
+        candidate = next(
+            variant
+            for variant in public_strategy_variants()
+            if variant.name == ALPHA_MODEL_VERSION
+        )
+        self.assertEqual(candidate.top_n, 15)
+        self.assertAlmostEqual(
+            candidate.weight_fip_momentum,
+            QUALITY_MOMENTUM_V1_5_WEIGHTS["fip_momentum"],
+        )
+        self.assertAlmostEqual(
+            candidate.weight_low_downside_volatility,
+            QUALITY_MOMENTUM_V1_5_WEIGHTS["low_downside_vol"],
+        )
+        self.assertAlmostEqual(
+            candidate.weight_drawdown_quality,
+            QUALITY_MOMENTUM_V1_5_WEIGHTS["drawdown_quality"],
+        )
 
     def test_metrics_cagr_and_drawdown(self) -> None:
         curve = pd.DataFrame(
@@ -326,6 +432,10 @@ class PublicResearchTests(unittest.TestCase):
     def test_public_config_rejects_infeasible_stock_cap(self) -> None:
         with self.assertRaises(ValueError):
             PublicStrategyConfig(top_n=10, max_stock_weight=0.05).validate()
+
+    def test_public_config_rejects_negative_factor_weight(self) -> None:
+        with self.assertRaisesRegex(ValueError, "非负有限数"):
+            PublicStrategyConfig(weight_fip_momentum=-0.01).validate()
 
     def test_suspended_position_is_never_scaled_to_fund_buys(self) -> None:
         config = PublicStrategyConfig()

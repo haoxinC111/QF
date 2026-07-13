@@ -33,6 +33,7 @@ from ashare_quant.report import (
     style_exposure_table,
 )
 from ashare_quant.research import (
+    run_alpha_comparison,
     run_cost_stress,
     run_factor_ablation,
     run_rolling_oos,
@@ -103,6 +104,15 @@ class AllocationAndConfigTests(unittest.TestCase):
             ),
         )
         with self.assertRaisesRegex(ValueError, "不能同时作为"):
+            invalid.validate()
+
+    def test_negative_alpha_weight_is_rejected(self) -> None:
+        base = AppConfig()
+        invalid = replace(
+            base,
+            strategy=replace(base.strategy, fip_momentum_weight=-0.01),
+        )
+        with self.assertRaisesRegex(ValueError, "非负有限数"):
             invalid.validate()
 
     def test_lot_ledger_enforces_t_plus_one(self) -> None:
@@ -527,23 +537,24 @@ class EndToEndTests(unittest.TestCase):
 
     def test_matched_benchmark_metrics_are_reported(self) -> None:
         metrics = calculate_metrics(self.result, self.config)
+        self.assertEqual(metrics["alpha_profile"], "quality_momentum_v1_5")
         self.assertIn("matched_benchmark_cagr", metrics)
         self.assertIn("benchmark_max_drawdown", metrics)
         self.assertIsNotNone(metrics["matched_benchmark_cagr"])
 
     def test_deterministic_golden_metrics(self) -> None:
         metrics = calculate_metrics(self.result, self.config)
-        self.assertAlmostEqual(float(metrics["final_nav"]), 870961.5596035972, places=4)
-        self.assertAlmostEqual(float(metrics["cagr"]), 0.04196309744833271, places=10)
+        self.assertAlmostEqual(float(metrics["final_nav"]), 856614.0873811552, places=4)
+        self.assertAlmostEqual(float(metrics["cagr"]), 0.03362532524814421, places=10)
         self.assertAlmostEqual(
-            float(metrics["max_drawdown"]), -0.0908917222450416, places=10
+            float(metrics["max_drawdown"]), -0.08648768376745919, places=10
         )
-        self.assertAlmostEqual(float(metrics["sharpe"]), 0.4919462883545638, places=10)
+        self.assertAlmostEqual(float(metrics["sharpe"]), 0.40551349043269524, places=10)
         self.assertAlmostEqual(
-            float(metrics["annual_turnover"]), 1.9195314006881268, places=10
+            float(metrics["annual_turnover"]), 1.9057423119675363, places=10
         )
-        self.assertAlmostEqual(float(metrics["total_fees"]), 5630.1728582604455, places=4)
-        self.assertEqual(int(metrics["filled_trade_count"]), 280)
+        self.assertAlmostEqual(float(metrics["total_fees"]), 5549.0402470266345, places=4)
+        self.assertEqual(int(metrics["filled_trade_count"]), 283)
 
     def test_exposure_tables_are_reported(self) -> None:
         industries = industry_exposure_table(self.result.selections)
@@ -552,6 +563,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertFalse(styles.empty)
         self.assertIn("stock_book_weight", industries)
         self.assertIn("z_size", styles)
+        self.assertIn("z_fip_momentum", styles)
+        self.assertIn("z_low_downside_vol", styles)
+        self.assertIn("z_drawdown_quality", styles)
 
 
 class ResearchSuiteTests(unittest.TestCase):
@@ -571,6 +585,22 @@ class ResearchSuiteTests(unittest.TestCase):
         result = run_factor_ablation(self.bundle, self.config, factors=["liquidity"])
         self.assertEqual(set(result["variant"]), {"full", "without_liquidity"})
         self.assertTrue(result["cagr"].notna().all())
+
+    def test_alpha_comparison_uses_two_frozen_profiles(self) -> None:
+        result = run_alpha_comparison(self.bundle, self.config)
+        self.assertEqual(
+            set(result["alpha_profile"]),
+            {"legacy_v1_4", "quality_momentum_v1_5"},
+        )
+        parsed = {
+            row.alpha_profile: json.loads(row.factor_weights)
+            for row in result.itertuples(index=False)
+        }
+        self.assertEqual(parsed["legacy_v1_4"]["fip_momentum"], 0.0)
+        self.assertEqual(
+            parsed["quality_momentum_v1_5"]["fip_momentum"],
+            0.25,
+        )
 
     def test_cost_stress_records_assumptions(self) -> None:
         result = run_cost_stress(

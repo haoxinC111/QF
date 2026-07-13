@@ -18,6 +18,11 @@ import numpy as np
 import pandas as pd
 import requests
 
+from .alpha import (
+    ALPHA_MODEL_VERSION,
+    QUALITY_MOMENTUM_V1_5_WEIGHTS,
+    build_price_alpha_features,
+)
 from .factors import _group_capped_allocation, _winsorized_zscore
 from .provenance import (
     build_file_inventory,
@@ -112,8 +117,11 @@ class PublicStrategyConfig:
     winsor_quantile: float = 0.05
     weight_mom_12_1: float = 0.35
     weight_mom_6_1: float = 0.20
+    weight_fip_momentum: float = 0.0
     weight_trend: float = 0.15
     weight_low_volatility: float = 0.20
+    weight_low_downside_volatility: float = 0.0
+    weight_drawdown_quality: float = 0.0
     weight_liquidity: float = 0.10
     commission_rate: float = 0.00025
     slippage_bps: float = 5.0
@@ -130,8 +138,13 @@ class PublicStrategyConfig:
             raise ValueError("top_n × max_stock_weight 无法容纳 risk_on_exposure")
         if not 0 <= self.risk_off_exposure <= self.risk_on_exposure <= 1:
             raise ValueError("风险仓位必须满足 0 <= risk_off <= risk_on <= 1")
-        if self.factor_weights.sum() <= 0:
+        weights = self.factor_weights
+        if (~np.isfinite(weights)).any() or (weights < 0).any():
+            raise ValueError("公开策略因子权重必须是非负有限数")
+        if weights.sum() <= 0:
             raise ValueError("至少需要一个正的因子权重")
+        if self.volatility_lookback < 20:
+            raise ValueError("volatility_lookback 至少为 20")
         if not self.regime_symbol or not self.performance_benchmark_symbol:
             raise ValueError("择时指数与业绩基准代码不能为空")
         if self.regime_symbol == self.performance_benchmark_symbol:
@@ -149,8 +162,11 @@ class PublicStrategyConfig:
             {
                 "mom_12_1": self.weight_mom_12_1,
                 "mom_6_1": self.weight_mom_6_1,
+                "fip_momentum": self.weight_fip_momentum,
                 "trend": self.weight_trend,
                 "low_volatility": self.weight_low_volatility,
+                "low_downside_vol": self.weight_low_downside_volatility,
+                "drawdown_quality": self.weight_drawdown_quality,
                 "liquidity": self.weight_liquidity,
             },
             dtype=float,
@@ -982,25 +998,12 @@ def _load_cached_bars(cache_dir: str | Path, symbols: Iterable[str]) -> pd.DataF
 
 
 def _build_features(bars: pd.DataFrame, volatility_lookback: int) -> pd.DataFrame:
-    frame = bars.copy().sort_values(["symbol", "date"])
+    frame = build_price_alpha_features(
+        bars,
+        price_column="close",
+        volatility_lookback=volatility_lookback,
+    )
     grouped = frame.groupby("symbol", sort=False, group_keys=False)
-    frame["return_1d"] = grouped["close"].pct_change(fill_method=None)
-    frame["mom_12_1"] = grouped["close"].transform(
-        lambda value: value.shift(21) / value.shift(252) - 1.0
-    )
-    frame["mom_6_1"] = grouped["close"].transform(
-        lambda value: value.shift(21) / value.shift(126) - 1.0
-    )
-    frame["ma_200"] = grouped["close"].transform(
-        lambda value: value.rolling(200, min_periods=200).mean()
-    )
-    frame["trend"] = frame["close"] / frame["ma_200"] - 1.0
-    frame["volatility"] = grouped["return_1d"].transform(
-        lambda value: value.rolling(
-            volatility_lookback, min_periods=max(20, volatility_lookback - 10)
-        ).std(ddof=0)
-        * math.sqrt(252.0)
-    )
     frame["avg_amount_20"] = grouped["amount"].transform(
         lambda value: value.rolling(20, min_periods=15).mean()
     )
@@ -1156,7 +1159,16 @@ def _select_targets(
         & (candidates["avg_amount_20"] >= config.min_avg_amount)
         & (candidates["close"] >= config.min_price)
     ]
-    required = ["mom_12_1", "mom_6_1", "trend", "volatility", "avg_amount_20"]
+    required = [
+        "mom_12_1",
+        "mom_6_1",
+        "fip_momentum",
+        "trend",
+        "volatility",
+        "downside_volatility",
+        "drawdown_quality",
+        "avg_amount_20",
+    ]
     candidates = candidates.dropna(subset=required)
     if config.stock_trend_filter:
         candidates = candidates.loc[candidates["trend"] > 0]
@@ -1164,6 +1176,7 @@ def _select_targets(
         return {}, pd.DataFrame(), "INSUFFICIENT_CANDIDATES"
 
     candidates["low_volatility"] = -candidates["volatility"]
+    candidates["low_downside_vol"] = -candidates["downside_volatility"]
     candidates["liquidity"] = np.log1p(candidates["avg_amount_20"])
     weights = config.factor_weights
     weights = weights / weights.sum()
@@ -1415,10 +1428,16 @@ def run_public_backtest(
 
 def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[PublicStrategyConfig]:
     base = base or PublicStrategyConfig()
-    return [
+    legacy_base = replace(
         base,
+        weight_fip_momentum=0.0,
+        weight_low_downside_volatility=0.0,
+        weight_drawdown_quality=0.0,
+    )
+    return [
+        legacy_base,
         replace(
-            base,
+            legacy_base,
             name="momentum_focus_15",
             top_n=15,
             exit_rank=25,
@@ -1431,7 +1450,7 @@ def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[P
             weight_liquidity=0.0,
         ),
         replace(
-            base,
+            legacy_base,
             name="balanced_momentum_20",
             risk_off_exposure=0.0,
             weight_mom_12_1=0.45,
@@ -1441,7 +1460,7 @@ def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[P
             weight_liquidity=0.0,
         ),
         replace(
-            base,
+            legacy_base,
             name="low_volatility_30",
             top_n=30,
             exit_rank=45,
@@ -1454,7 +1473,7 @@ def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[P
             weight_liquidity=0.05,
         ),
         replace(
-            base,
+            legacy_base,
             name="concentrated_momentum_10",
             top_n=10,
             exit_rank=18,
@@ -1468,7 +1487,7 @@ def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[P
             weight_liquidity=0.0,
         ),
         replace(
-            base,
+            legacy_base,
             name="medium_momentum_15",
             top_n=15,
             exit_rank=25,
@@ -1480,6 +1499,26 @@ def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[P
             weight_trend=0.15,
             weight_low_volatility=0.10,
             weight_liquidity=0.0,
+        ),
+        replace(
+            legacy_base,
+            name=ALPHA_MODEL_VERSION,
+            top_n=15,
+            exit_rank=25,
+            max_stock_weight=0.09,
+            risk_off_exposure=0.0,
+            weight_mom_12_1=QUALITY_MOMENTUM_V1_5_WEIGHTS["mom_12_1"],
+            weight_mom_6_1=QUALITY_MOMENTUM_V1_5_WEIGHTS["mom_6_1"],
+            weight_fip_momentum=QUALITY_MOMENTUM_V1_5_WEIGHTS["fip_momentum"],
+            weight_trend=QUALITY_MOMENTUM_V1_5_WEIGHTS["trend"],
+            weight_low_volatility=QUALITY_MOMENTUM_V1_5_WEIGHTS["low_vol"],
+            weight_low_downside_volatility=QUALITY_MOMENTUM_V1_5_WEIGHTS[
+                "low_downside_vol"
+            ],
+            weight_drawdown_quality=QUALITY_MOMENTUM_V1_5_WEIGHTS[
+                "drawdown_quality"
+            ],
+            weight_liquidity=QUALITY_MOMENTUM_V1_5_WEIGHTS["liquidity"],
         ),
     ]
 
@@ -1601,6 +1640,29 @@ def write_public_research(
             f"{percentage(row.max_drawdown)} | {row.sharpe:.2f} | "
             f"{percentage(row.benchmark_cagr)} | {percentage(row.annual_one_way_turnover)} |"
         )
+    metric_index = metrics.set_index(["strategy", "period"])
+    report_lines.extend(
+        [
+            "",
+            "## v1.5 Alpha 同约束增量",
+            "",
+            "`quality_momentum_v1_5` 与 `momentum_focus_15` 使用相同持股数、排名缓冲、"
+            "单股上限和风险仓位；下表只比较选股 Alpha 变化。",
+            "",
+            "| 区间 | v1.4 年化 | v1.5 年化 | 年化差 | 回撤差 | 夏普差 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for period in periods:
+        legacy = metric_index.loc[("momentum_focus_15", period)]
+        enhanced = metric_index.loc[(ALPHA_MODEL_VERSION, period)]
+        report_lines.append(
+            f"| {period} | {percentage(legacy['cagr'])} | "
+            f"{percentage(enhanced['cagr'])} | "
+            f"{percentage(enhanced['cagr'] - legacy['cagr'])} | "
+            f"{percentage(enhanced['max_drawdown'] - legacy['max_drawdown'])} | "
+            f"{enhanced['sharpe'] - legacy['sharpe']:.2f} |"
+        )
     holdout = metrics.loc[
         metrics["period"].eq("historical_holdout_seen_2022_2025")
     ].sort_values("cagr", ascending=False)
@@ -1640,9 +1702,16 @@ def write_public_research(
         "cache_dir": str(Path(cache_dir).resolve()),
         "periods": periods,
         "selection_protocol": (
-            "六组参数最初在 v1.3 运行前预定义；2022-2025 结果现已查看，"
-            "不得在后续研究中继续宣称为未触碰样本外。"
+            "六组旧参数在 v1.3 运行前预定义；quality_momentum_v1_5 的公式与权重"
+            "在首次生成 v1.5 结果前冻结。但 2013-2025 市场结果已被旧研究查看，"
+            "所有区间都只属于历史回放，不得宣称为未触碰样本外。"
         ),
+        "alpha_protocol": {
+            "model": ALPHA_MODEL_VERSION,
+            "weights": dict(QUALITY_MOMENTUM_V1_5_WEIGHTS),
+            "parameter_search": "none",
+            "historical_market_periods_seen_before_design": True,
+        },
         "period_status": {
             "development_2013_2017": "seen_development",
             "validation_2018_2021": "seen_validation",
@@ -1680,7 +1749,7 @@ def write_public_research(
         reproducibility,
         experiment_type="public_research",
         protocol={
-            "parameters": "six_predeclared_v1_3_variants",
+            "parameters": "six_legacy_v1_3_plus_frozen_quality_momentum_v1_5",
             "historical_holdout_2022_2025": "seen",
             "prospective_holdout_start": "2026-01-01",
             "untouched_holdout_certified": False,
@@ -1724,7 +1793,7 @@ def write_public_robustness(
     output_dir: str | Path,
     base_config: PublicStrategyConfig | None = None,
 ) -> dict[str, Path]:
-    """Cost stress and factor ablation for the predeclared momentum candidate."""
+    """Cost stress and factor ablation for the frozen v1.5 alpha candidate."""
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     base_config = base_config or PublicStrategyConfig()
@@ -1732,7 +1801,9 @@ def write_public_robustness(
         membership_path, cache_dir, seal_legacy=True
     )
     candidate = next(
-        variant for variant in public_strategy_variants(base_config) if variant.name == "momentum_focus_15"
+        variant
+        for variant in public_strategy_variants(base_config)
+        if variant.name == ALPHA_MODEL_VERSION
     )
     periods = {
         "historical_holdout_seen_2022_2025": ("2022-01-01", "2025-12-31"),
@@ -1741,7 +1812,11 @@ def write_public_robustness(
 
     cost_rows: list[dict[str, object]] = []
     for slippage in [5.0, 10.0, 20.0]:
-        stressed = replace(candidate, name=f"momentum_focus_15_slippage_{slippage:g}", slippage_bps=slippage)
+        stressed = replace(
+            candidate,
+            name=f"{ALPHA_MODEL_VERSION}_slippage_{slippage:g}",
+            slippage_bps=slippage,
+        )
         LOGGER.info("公开数据成本压力: %.0f bps", slippage)
         result = run_public_backtest(membership_path, cache_dir, stressed)
         for period, (start, end) in periods.items():
@@ -1759,13 +1834,19 @@ def write_public_robustness(
     factor_fields = {
         "mom_12_1": "weight_mom_12_1",
         "mom_6_1": "weight_mom_6_1",
+        "fip_momentum": "weight_fip_momentum",
         "trend": "weight_trend",
-        "low_volatility": "weight_low_volatility",
+        "low_downside_vol": "weight_low_downside_volatility",
+        "drawdown_quality": "weight_drawdown_quality",
     }
     ablation_configs = [("full", candidate)] + [
         (
             f"without_{factor}",
-            replace(candidate, name=f"momentum_focus_15_without_{factor}", **{field: 0.0}),
+            replace(
+                candidate,
+                name=f"{ALPHA_MODEL_VERSION}_without_{factor}",
+                **{field: 0.0},
+            ),
         )
         for factor, field in factor_fields.items()
     ]
@@ -1788,7 +1869,9 @@ def write_public_robustness(
     lines = [
         "# 公开数据稳健性检查",
         "",
-        "候选参数最初在查看 2022–2025 结果前固定为 `momentum_focus_15`。该区间现已查看，本页只提高成本和删除因子，不再把它宣称为未触碰样本外。",
+        f"`{ALPHA_MODEL_VERSION}` 的公式和权重在生成 v1.5 新结果前固定。"
+        "但 2022–2025 市场结果已在旧策略研究中被查看，因此本页只属于历史回放，"
+        "不能宣称为未触碰样本外。",
         "",
         "## 滑点压力",
         "",
@@ -1837,9 +1920,9 @@ def write_public_robustness(
         reproducibility,
         experiment_type="public_robustness",
         protocol={
-            "candidate": "momentum_focus_15",
+            "candidate": ALPHA_MODEL_VERSION,
             "historical_holdout_2022_2025": "seen",
-            "optimization": "none_cost_stress_and_ablation_only",
+            "optimization": "frozen_v1_5_weights_cost_stress_and_ablation_only",
             "untouched_holdout_certified": False,
         },
         artifacts=[report_path, cost_path, ablation_path, reproducibility_path],

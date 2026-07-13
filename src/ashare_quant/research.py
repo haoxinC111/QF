@@ -7,6 +7,11 @@ from typing import Iterable, Sequence
 
 import pandas as pd
 
+from .alpha import (
+    ALPHA_MODEL_VERSION,
+    LEGACY_V1_4_WEIGHTS,
+    QUALITY_MOMENTUM_V1_5_WEIGHTS,
+)
 from .backtest import Backtester
 from .config import AppConfig
 from .data import MarketDataBundle
@@ -22,8 +27,11 @@ from .provenance import (
 FACTOR_FIELDS = {
     "mom_12_1": "momentum_12_1_weight",
     "mom_6_1": "momentum_6_1_weight",
+    "fip_momentum": "fip_momentum_weight",
     "trend": "trend_weight",
     "low_vol": "low_volatility_weight",
+    "low_downside_vol": "low_downside_volatility_weight",
+    "drawdown_quality": "drawdown_quality_weight",
     "liquidity": "liquidity_weight",
 }
 
@@ -38,7 +46,14 @@ def run_factor_ablation(
     factors: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     """Run the full model and one leave-one-factor-out backtest per factor."""
-    requested = list(factors or FACTOR_FIELDS)
+    requested = list(
+        factors
+        or [
+            factor
+            for factor, field in FACTOR_FIELDS.items()
+            if getattr(config.strategy, field) > 0
+        ]
+    )
     unknown = sorted(set(requested).difference(FACTOR_FIELDS))
     if unknown:
         raise ValueError("未知因子: " + ", ".join(unknown))
@@ -56,6 +71,39 @@ def run_factor_ablation(
                 "variant": variant,
                 "removed_factor": "" if variant == "full" else variant.removeprefix("without_"),
                 **metrics,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def run_alpha_comparison(
+    bundle: MarketDataBundle,
+    config: AppConfig,
+) -> pd.DataFrame:
+    """Compare frozen v1.4 and v1.5 alpha weights under identical controls."""
+    profiles = {
+        "legacy_v1_4": LEGACY_V1_4_WEIGHTS,
+        ALPHA_MODEL_VERSION: QUALITY_MOMENTUM_V1_5_WEIGHTS,
+    }
+    records: list[dict[str, object]] = []
+    for profile, weights in profiles.items():
+        strategy = replace(
+            config.strategy,
+            **{
+                FACTOR_FIELDS[factor]: float(weight)
+                for factor, weight in weights.items()
+            },
+        )
+        case_config = replace(config, strategy=strategy)
+        records.append(
+            {
+                "alpha_profile": profile,
+                "factor_weights": json.dumps(
+                    dict(weights),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                **_run_metrics(bundle, case_config),
             }
         )
     return pd.DataFrame(records)
@@ -152,14 +200,14 @@ def write_research_suite(
     bundle: MarketDataBundle,
     config: AppConfig,
     output_dir: str | Path,
-    modes: Iterable[str] = ("ablation", "cost", "rolling"),
+    modes: Iterable[str] = ("alpha", "ablation", "cost", "rolling"),
     slippage_bps: Sequence[float] = (5.0, 10.0, 20.0),
     commission_multipliers: Sequence[float] = (1.0, 2.0),
     train_years: int = 5,
     test_years: int = 1,
 ) -> dict[str, Path]:
     requested = list(dict.fromkeys(str(mode).strip().lower() for mode in modes))
-    supported = {"ablation", "cost", "rolling"}
+    supported = {"alpha", "ablation", "cost", "rolling"}
     unknown = sorted(set(requested).difference(supported))
     if unknown:
         raise ValueError("未知研究模式: " + ", ".join(unknown))
@@ -169,6 +217,10 @@ def write_research_suite(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
+    if "alpha" in requested:
+        path = output / "alpha_comparison.csv"
+        run_alpha_comparison(bundle, config).to_csv(path, index=False)
+        written["alpha"] = path
     if "ablation" in requested:
         path = output / "factor_ablation.csv"
         run_factor_ablation(bundle, config).to_csv(path, index=False)
@@ -199,6 +251,10 @@ def write_research_suite(
         "train_years": train_years,
         "test_years": test_years,
         "note": "滚动样本外使用冻结参数；训练窗只表示参数研究与冻结区间，不执行自动寻优。",
+        "alpha_profiles": {
+            "legacy_v1_4": dict(LEGACY_V1_4_WEIGHTS),
+            ALPHA_MODEL_VERSION: dict(QUALITY_MOMENTUM_V1_5_WEIGHTS),
+        },
         "evaluation_protocol": "fixed_parameter_rolling_evaluation",
         "automatic_parameter_fitting": False,
         "untouched_holdout_certified": False,

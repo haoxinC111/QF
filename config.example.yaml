@@ -34,11 +34,15 @@ strategy:
   min_price: 3
   winsor_quantile: 0.05
   stock_trend_filter: true
-  momentum_12_1_weight: 0.35
-  momentum_6_1_weight: 0.20
-  trend_weight: 0.15
-  low_volatility_weight: 0.20
-  liquidity_weight: 0.10
+  # v1.5 quality_momentum：权重在历史重跑前冻结；成交额仅作准入门槛。
+  momentum_12_1_weight: 0.25
+  momentum_6_1_weight: 0.15
+  fip_momentum_weight: 0.25
+  trend_weight: 0.10
+  low_volatility_weight: 0.00
+  low_downside_volatility_weight: 0.15
+  drawdown_quality_weight: 0.10
+  liquidity_weight: 0.00
   volatility_lookback: 60
   benchmark_ma_days: 200
   risk_on_exposure: 0.95

@@ -84,6 +84,7 @@ class BacktestResult:
 
 class Backtester:
     def __init__(self, bundle: MarketDataBundle, config: AppConfig) -> None:
+        config.validate()
         self.bundle = bundle.prepare(strict=config.data.strict_validation)
         self.config = config
         self.strategy = MultiFactorStrategy(self.bundle, config.strategy)

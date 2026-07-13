@@ -7,6 +7,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from .alpha import QUALITY_MOMENTUM_V1_5_WEIGHTS
+
 
 def _date_text(value: Any) -> str:
     if isinstance(value, (date, datetime)):
@@ -53,11 +55,18 @@ class StrategyConfig:
     min_price: float = 3.0
     winsor_quantile: float = 0.05
     stock_trend_filter: bool = True
-    momentum_12_1_weight: float = 0.35
-    momentum_6_1_weight: float = 0.20
-    trend_weight: float = 0.15
-    low_volatility_weight: float = 0.20
-    liquidity_weight: float = 0.10
+    momentum_12_1_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["mom_12_1"]
+    momentum_6_1_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["mom_6_1"]
+    fip_momentum_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["fip_momentum"]
+    trend_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["trend"]
+    low_volatility_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["low_vol"]
+    low_downside_volatility_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS[
+        "low_downside_vol"
+    ]
+    drawdown_quality_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS[
+        "drawdown_quality"
+    ]
+    liquidity_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["liquidity"]
     volatility_lookback: int = 60
     benchmark_ma_days: int = 200
     risk_on_exposure: float = 0.95
@@ -78,8 +87,11 @@ class StrategyConfig:
         return {
             "mom_12_1": self.momentum_12_1_weight,
             "mom_6_1": self.momentum_6_1_weight,
+            "fip_momentum": self.fip_momentum_weight,
             "trend": self.trend_weight,
             "low_vol": self.low_volatility_weight,
+            "low_downside_vol": self.low_downside_volatility_weight,
+            "drawdown_quality": self.drawdown_quality_weight,
             "liquidity": self.liquidity_weight,
         }
 
@@ -208,6 +220,15 @@ class AppConfig:
         factor_sum = sum(self.strategy.factor_weights.values())
         if factor_sum <= 0:
             raise ValueError("因子权重之和必须大于 0")
+        negative_factors = [
+            name
+            for name, value in self.strategy.factor_weights.items()
+            if not 0 <= value < float("inf")
+        ]
+        if negative_factors:
+            raise ValueError("因子权重必须是非负有限数: " + ", ".join(negative_factors))
+        if self.strategy.volatility_lookback < 20:
+            raise ValueError("volatility_lookback 至少为 20")
         if not 0 <= self.strategy.winsor_quantile < 0.5:
             raise ValueError("winsor_quantile 必须在 [0, 0.5) 内")
         for name, exposure in {

@@ -6,6 +6,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .alpha import build_price_alpha_features
 from .config import StrategyConfig
 from .data import MarketDataBundle
 
@@ -133,25 +134,12 @@ class MultiFactorStrategy:
         frame["log_total_mv"] = np.log(
             pd.to_numeric(frame["total_mv"], errors="coerce").clip(lower=1e-12)
         )
+        frame = build_price_alpha_features(
+            frame,
+            price_column="total_close",
+            volatility_lookback=self.config.volatility_lookback,
+        )
         grouped = frame.groupby("symbol", sort=False, group_keys=False)
-        frame["return_1d"] = grouped["total_close"].pct_change(fill_method=None)
-        frame["mom_12_1"] = grouped["total_close"].transform(
-            lambda value: value.shift(21) / value.shift(252) - 1.0
-        )
-        frame["mom_6_1"] = grouped["total_close"].transform(
-            lambda value: value.shift(21) / value.shift(126) - 1.0
-        )
-        frame["ma_200"] = grouped["total_close"].transform(
-            lambda value: value.rolling(200, min_periods=200).mean()
-        )
-        frame["trend"] = frame["total_close"] / frame["ma_200"] - 1.0
-        lookback = self.config.volatility_lookback
-        frame["volatility"] = grouped["return_1d"].transform(
-            lambda value: value.rolling(
-                lookback, min_periods=max(20, lookback - 10)
-            ).std(ddof=0)
-            * np.sqrt(252.0)
-        )
         frame["avg_amount_20"] = grouped["amount"].transform(
             lambda value: value.rolling(20, min_periods=15).mean()
         )
@@ -280,7 +268,16 @@ class MultiFactorStrategy:
         ]
         if self.config.stock_trend_filter:
             candidates = candidates.loc[candidates["trend"] > 0.0]
-        required = ["mom_12_1", "mom_6_1", "trend", "volatility", "avg_amount_20"]
+        required = [
+            "mom_12_1",
+            "mom_6_1",
+            "fip_momentum",
+            "trend",
+            "volatility",
+            "downside_volatility",
+            "drawdown_quality",
+            "avg_amount_20",
+        ]
         if self.config.require_size_data:
             required.append("log_total_mv")
         candidates = candidates.dropna(subset=required)
@@ -310,8 +307,11 @@ class MultiFactorStrategy:
         factor_inputs = {
             "mom_12_1": candidates["mom_12_1"],
             "mom_6_1": candidates["mom_6_1"],
+            "fip_momentum": candidates["fip_momentum"],
             "trend": candidates["trend"],
             "low_vol": -candidates["volatility"],
+            "low_downside_vol": -candidates["downside_volatility"],
+            "drawdown_quality": candidates["drawdown_quality"],
             "liquidity": np.log1p(candidates["avg_amount_20"]),
         }
         weights = self.config.factor_weights
@@ -380,13 +380,20 @@ class MultiFactorStrategy:
             "z_size",
             "mom_12_1",
             "mom_6_1",
+            "information_discreteness",
+            "fip_momentum",
             "trend",
             "volatility",
+            "downside_volatility",
+            "drawdown_quality",
             "avg_amount_20",
             "z_mom_12_1",
             "z_mom_6_1",
+            "z_fip_momentum",
             "z_trend",
             "z_low_vol",
+            "z_low_downside_vol",
+            "z_drawdown_quality",
             "z_liquidity",
         ]
         return SignalPlan(
