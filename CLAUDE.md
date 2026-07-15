@@ -25,6 +25,7 @@
   - `v1.5.0`：新增共享质量动量 Alpha、冻结版本对照、逐因子消融和防前视测试
   - `v1.5.1`：恢复 legacy 默认 Alpha，标记 v1.5 候选治理状态，补充公开数据逐月覆盖审计
   - `v1.6.0`：新增收缩协方差/换手平滑组合候选、平方根市场冲击、成交审计和四臂归因
+  - `v2.0.0a1`：新增独立 PIT 财报/估值侧车、公告/修订可见性、缓存身份绑定和配置迁移；生产策略不变
 
 ## 3. ZIP 处理标准流程
 
@@ -37,7 +38,7 @@
    ```
 2. **核对顶层结构**：有的版本把项目放在 `a_share_quant/` 子目录下，有的直接放在根目录。解压后先确认 `run.py` 和 `src/ashare_quant/` 的位置。
 3. **与当前代码做差异比较**：
-   - 核心模块：`src/ashare_quant/{config,data,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
+- 核心模块：`src/ashare_quant/{config,data,pit_data,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
    - 配置：`config.example.yaml`、`pyproject.toml`、`requirements*.txt`
    - 文档：`README.md`、`V1.*_VALIDATION.md`、`PUBLIC_SOURCE_AUDIT.md`
    - 测试：`tests/`
@@ -64,6 +65,7 @@
 - **公开通道**：必须准备 `unliftedq/index-constitution` 的 `history/csi300.csv`，固定提交 `16d9d69fc0bf7f0f5e9aace868e16e26f2ecb5c2`。
 - 首次运行公开回测时需要联网下载行情缓存到 `data/public_eastmoney/`。
 - v1.4 的严格缓存为 v4，新增 `regime.csv.gz` 和逐文件 SHA256；旧 v3 缓存需要 `data.refresh: true` 重新生成。
+- V2 PIT 缓存是独立侧车，必须和 v4 基础行情 manifest 的 SHA256/数据指纹匹配；不得用 PIT 下载器覆盖基础行情缓存。
 - v1.3 公开缓存无需重下，先运行 `public-verify --seal-legacy` 生成指纹；此后校验失败不得自动覆盖或重新封存。
 
 ### 4.4 网络与环境
@@ -75,6 +77,7 @@
 - 用 `config.example.yaml` 生成 `config.yaml`，不要直接修改示例文件。
 - v1.4 配置新增 `data.regime_index`；升级时必须确认它是价格指数，并与全收益 `benchmark_index` 分离。
 - v1.6 配置新增 `portfolio` 段和 `execution.market_impact_*`；生产默认必须保持 `inverse_vol_v1_4 + fixed_bps`，新模型只能显式启用并标记实验状态。
+- V2 配置结构为 `schema_version: 2`，新增 `point_in_time` 段且默认关闭；旧 YAML 可迁移，但 PIT 数据不能静默进入生产 Alpha。
 
 ## 5. 何时必须提问或上报
 
@@ -118,6 +121,10 @@ python run.py demo --output results/demo
 
 # 严格通道数据校验
 python run.py validate-data --config config.yaml
+
+# V2 PIT 侧车下载与校验（需 point_in_time.enabled=true）
+python run.py pit-download --config config.yaml
+python run.py pit-verify --config config.yaml
 
 # 公开通道下载
 python run.py public-download --membership csi300.csv --cache data/public_eastmoney --source sina

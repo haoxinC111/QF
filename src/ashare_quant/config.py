@@ -35,6 +35,9 @@ _FACTOR_CONFIG_FIELDS = {
     "liquidity": "liquidity_weight",
 }
 
+CONFIG_SCHEMA_VERSION = 2
+SUPPORTED_CONFIG_SCHEMA_VERSIONS = {1, CONFIG_SCHEMA_VERSION}
+
 
 def _date_text(value: Any) -> str:
     if isinstance(value, (date, datetime)):
@@ -58,6 +61,22 @@ class DataConfig:
     strict_validation: bool = True
     industry_standard: str = "SW2021"
     industry_level: str = "L1"
+
+
+@dataclass(frozen=True)
+class PointInTimeDataConfig:
+    """V2 sidecar data configuration; disabled to preserve v1.6 behavior."""
+
+    enabled: bool = False
+    provider: str = "tushare"
+    cache_dir: str = "data/pit_cache"
+    history_years: int = 6
+    fundamental_lag_trading_days: int = 1
+    valuation_lag_trading_days: int = 0
+    maximum_fundamental_age_days: int = 550
+    maximum_valuation_age_days: int = 10
+    minimum_symbol_coverage: float = 0.90
+    refresh: bool = False
 
 
 @dataclass(frozen=True)
@@ -197,7 +216,11 @@ class ExecutionConfig:
 
 @dataclass(frozen=True)
 class AppConfig:
+    schema_version: int = CONFIG_SCHEMA_VERSION
     data: DataConfig = field(default_factory=DataConfig)
+    point_in_time: PointInTimeDataConfig = field(
+        default_factory=PointInTimeDataConfig
+    )
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
@@ -210,6 +233,26 @@ class AppConfig:
             raw = yaml.safe_load(handle) or {}
         if not isinstance(raw, Mapping):
             raise ValueError("配置文件顶层必须是映射结构")
+        declared_schema = int(raw.get("schema_version", 1))
+        if declared_schema not in SUPPORTED_CONFIG_SCHEMA_VERSIONS:
+            raise ValueError(
+                f"配置结构版本 {declared_schema} 不受支持；"
+                f"当前支持 {sorted(SUPPORTED_CONFIG_SCHEMA_VERSIONS)}"
+            )
+        known_sections = {
+            "schema_version",
+            "data",
+            "point_in_time",
+            "backtest",
+            "strategy",
+            "portfolio",
+            "execution",
+        }
+        unknown_sections = sorted(set(raw).difference(known_sections))
+        if unknown_sections:
+            raise ValueError(
+                "配置文件包含未知顶层字段: " + ", ".join(unknown_sections)
+            )
         execution_values = dict(raw.get("execution", {}))
         fee_values = execution_values.pop("fee_schedule", None)
         fee_schedule = (
@@ -259,26 +302,41 @@ class AppConfig:
                         "自定义权重请设置 alpha_profile=custom"
                     )
                 strategy_values[field_name] = float(value)
-        config = cls(
-            data=DataConfig(**dict(raw.get("data", {}))),
-            backtest=BacktestConfig(
-                **{
-                    **dict(raw.get("backtest", {})),
+        try:
+            config = cls(
+                schema_version=CONFIG_SCHEMA_VERSION,
+                data=DataConfig(**dict(raw.get("data", {}))),
+                point_in_time=PointInTimeDataConfig(
+                    **dict(raw.get("point_in_time", {}))
+                ),
+                backtest=BacktestConfig(
                     **{
-                        key: _date_text(value)
-                        for key, value in dict(raw.get("backtest", {})).items()
-                        if key in {"start_date", "end_date"}
-                    },
-                }
-            ),
-            strategy=StrategyConfig(**strategy_values),
-            portfolio=PortfolioConfig(**dict(raw.get("portfolio", {}))),
-            execution=ExecutionConfig(**execution_values, fee_schedule=fee_schedule),
-        )
+                        **dict(raw.get("backtest", {})),
+                        **{
+                            key: _date_text(value)
+                            for key, value in dict(
+                                raw.get("backtest", {})
+                            ).items()
+                            if key in {"start_date", "end_date"}
+                        },
+                    }
+                ),
+                strategy=StrategyConfig(**strategy_values),
+                portfolio=PortfolioConfig(**dict(raw.get("portfolio", {}))),
+                execution=ExecutionConfig(
+                    **execution_values, fee_schedule=fee_schedule
+                ),
+            )
+        except TypeError as exc:
+            raise ValueError(f"配置字段无效: {exc}") from exc
         config.validate()
         return config
 
     def validate(self) -> None:
+        if self.schema_version != CONFIG_SCHEMA_VERSION:
+            raise ValueError(
+                f"运行时配置必须升级为 schema_version={CONFIG_SCHEMA_VERSION}"
+            )
         start = datetime.strptime(self.backtest.start_date, "%Y-%m-%d")
         end = datetime.strptime(self.backtest.end_date, "%Y-%m-%d")
         if start >= end:
@@ -356,6 +414,59 @@ class AppConfig:
             raise ValueError("industry_standard 仅支持 SW2014 或 SW2021")
         if self.data.industry_level not in {"L1", "L2", "L3"}:
             raise ValueError("industry_level 仅支持 L1、L2 或 L3")
+        if self.point_in_time.provider != "tushare":
+            raise ValueError("point_in_time.provider 当前仅支持 tushare")
+        for name, value in {
+            "enabled": self.point_in_time.enabled,
+            "refresh": self.point_in_time.refresh,
+        }.items():
+            if not isinstance(value, bool):
+                raise ValueError(f"point_in_time.{name} 必须是布尔值")
+        if not str(self.point_in_time.cache_dir).strip():
+            raise ValueError("point_in_time.cache_dir 不能为空")
+        integer_fields = {
+            "history_years": self.point_in_time.history_years,
+            "fundamental_lag_trading_days": (
+                self.point_in_time.fundamental_lag_trading_days
+            ),
+            "valuation_lag_trading_days": (
+                self.point_in_time.valuation_lag_trading_days
+            ),
+            "maximum_fundamental_age_days": (
+                self.point_in_time.maximum_fundamental_age_days
+            ),
+            "maximum_valuation_age_days": (
+                self.point_in_time.maximum_valuation_age_days
+            ),
+        }
+        non_integer = [
+            name
+            for name, value in integer_fields.items()
+            if not isinstance(value, int) or isinstance(value, bool)
+        ]
+        if non_integer:
+            raise ValueError(
+                "point_in_time 整数参数类型错误: "
+                + ", ".join(non_integer)
+            )
+        if not 1 <= self.point_in_time.history_years <= 15:
+            raise ValueError("point_in_time.history_years 必须在 [1, 15] 内")
+        for name, value in {
+            "fundamental_lag_trading_days": (
+                self.point_in_time.fundamental_lag_trading_days
+            ),
+            "valuation_lag_trading_days": (
+                self.point_in_time.valuation_lag_trading_days
+            ),
+        }.items():
+            if not 0 <= value <= 5:
+                raise ValueError(f"{name} 必须在 [0, 5] 内")
+        if self.point_in_time.maximum_fundamental_age_days < 90:
+            raise ValueError("maximum_fundamental_age_days 至少为 90")
+        if self.point_in_time.maximum_valuation_age_days < 0:
+            raise ValueError("maximum_valuation_age_days 不能为负")
+        if not 0 < self.point_in_time.minimum_symbol_coverage <= 1:
+            raise ValueError("minimum_symbol_coverage 必须在 (0, 1] 内")
         for name, value in {
             "universe_index": self.data.universe_index,
             "regime_index": self.data.regime_index,
@@ -434,13 +545,20 @@ class AppConfig:
         """Return a copy with relative cache/output paths anchored at base_dir."""
         base = Path(base_dir).resolve()
         data_values = asdict(self.data)
+        point_in_time_values = asdict(self.point_in_time)
         backtest_values = asdict(self.backtest)
         if not Path(self.data.cache_dir).is_absolute():
             data_values["cache_dir"] = str(base / self.data.cache_dir)
         if not Path(self.backtest.output_dir).is_absolute():
             backtest_values["output_dir"] = str(base / self.backtest.output_dir)
+        if not Path(self.point_in_time.cache_dir).is_absolute():
+            point_in_time_values["cache_dir"] = str(
+                base / self.point_in_time.cache_dir
+            )
         return AppConfig(
+            schema_version=self.schema_version,
             data=DataConfig(**data_values),
+            point_in_time=PointInTimeDataConfig(**point_in_time_values),
             backtest=BacktestConfig(**backtest_values),
             strategy=self.strategy,
             portfolio=self.portfolio,

@@ -1,3 +1,5 @@
+schema_version: 2
+
 data:
   provider: tushare
   cache_dir: data/cache
@@ -15,6 +17,22 @@ data:
   strict_validation: true
   industry_standard: SW2021
   industry_level: L1
+
+# V2.0 第一阶段的独立时点数据侧车。默认关闭，因此不会改变 v1.6 回测。
+# 启用前需先准备并校验上方 data.cache_dir 的基础行情缓存。
+point_in_time:
+  enabled: false
+  provider: tushare
+  cache_dir: data/pit_cache
+  # 为回测开始日前补足财报历史，便于后续计算增长率与质量因子。
+  history_years: 6
+  # 财报公告至少到下一交易日才可见；日终估值在当日收盘后可见。
+  fundamental_lag_trading_days: 1
+  valuation_lag_trading_days: 0
+  maximum_fundamental_age_days: 550
+  maximum_valuation_age_days: 10
+  minimum_symbol_coverage: 0.90
+  refresh: false
 
 backtest:
   start_date: 2018-01-01

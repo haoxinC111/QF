@@ -1,6 +1,6 @@
 # A股动态股票池多因子量化回测
 
-这是一个研究/回测级的 Python 项目。v1.5.1 根据真实公开历史回放把生产 Alpha 默认恢复为 `legacy_v1_4`；v1.6 在保持该 Alpha 与入选证券不变的前提下，新增可审计的收缩协方差组合模型和平方根市场冲击模型。两项 v1.6 能力目前均为显式启用的实验模型，生产默认不变。严格通道继续建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、部分成交、滑点和成交容量。
+这是一个研究/回测级的 Python 项目。v1.5.1 根据真实公开历史回放把生产 Alpha 默认恢复为 `legacy_v1_4`；v1.6 在保持该 Alpha 与入选证券不变的前提下，新增可审计的收缩协方差组合模型和平方根市场冲击模型。V2.0 Alpha 1 又新增独立的 Point-in-Time 财报/估值侧车、公告可见性规则和不可变快照，但尚未把这些数据接入生产 Alpha。所有 V2 能力默认关闭，v1.6 生产路径与结果保持不变。严格通道继续建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、部分成交、滑点和成交容量。
 
 > 重要：本项目不构成投资建议，不承诺收益，也没有连接券商下单。先用离线演示确认环境，再用自己的数据权限回测；任何真实资金使用前，都应做样本外检验、压力测试、人工复核和小资金仿真。
 
@@ -55,6 +55,12 @@ v1.5 实验候选的公式、冻结权重和原始协议详见 [`V1.5_ALPHA.md`]
 ### 风险开关
 
 信号日沪深 300 价格指数收盘价不低于其 200 日均线时，目标股票仓位为 95%；否则为 30%。这是一个简单、可解释的系统性风险控制，不是对市场方向的保证。剩余部分保持现金。价格指数只生成风险状态；长期收益、回撤和超额收益使用独立的全收益基准计算。
+
+### V2.0 第一阶段：时点数据基础
+
+`2.0.0a1` 把财报和日终估值放在独立 `data/pit_cache/` 侧车中，并通过基础行情 manifest 的 SHA256 与数据指纹绑定。财报默认在公告后的下一交易日可见；修订只从其自身可用日开始替换旧版本。读取时重新计算可用日并核对全部分区 SHA256，未来记录扰动不能改变过去快照。
+
+该模块目前只支持下载、校验和导出研究快照，不参与默认选股或权重计算。因此它是后续基本面 Alpha 研究的可信输入层，不是收益提升声明。完整数据契约、命令和验收边界见 [`V2.0_ALPHA1_PIT_DATA.md`](V2.0_ALPHA1_PIT_DATA.md)。
 
 ## 二、回测中建模的 A 股约束
 
@@ -270,6 +276,17 @@ python run.py validate-data --config config.yaml
 python run.py backtest --config config.yaml
 ```
 
+若要准备 V2 的财报/估值时点数据，把配置中的 `point_in_time.enabled` 改为 `true`，在基础行情缓存完成后执行：
+
+```bash
+python run.py pit-download --config config.yaml
+python run.py pit-verify --config config.yaml
+python run.py pit-snapshot --config config.yaml --date 2020-04-01 \
+  --output results/pit_snapshot_2020-04-01.csv
+```
+
+快照会同时生成包含文件 SHA256、PIT 数据指纹和基础行情指纹的 `.manifest.json`。这不会自动让财报数据进入生产策略。
+
 v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manifest.json` 保存所有实际输入文件的大小和 SHA256。旧 v3 缓存不能静默复用；首次升级必须把 `data.refresh` 改为 `true` 运行一次 `download`，完成后再改回 `false`。
 
 ## 四、输出文件
@@ -350,6 +367,15 @@ python run.py result-verify --output results/public_research/robustness --strict
 - `calls_per_minute`：不能高于你的接口权限。遇到限流时调低。
 - `industry_standard` / `industry_level`：默认申万 2021 一级行业。层级越细，接口调用和约束不可行风险越高。
 
+### V2 时点数据
+
+- `point_in_time.enabled`：默认 `false`；只有显式启用后，PIT 命令和联合数据校验才会运行。
+- `history_years`：在回测开始日前额外下载的财报历史年数，用于后续构造增长与 TTM 指标。
+- `fundamental_lag_trading_days`：财报公告后的可见性滞后，默认 1；不要为了改善回测把它改成不符合信号时刻的数值。
+- `valuation_lag_trading_days`：日终估值的可见性滞后；收盘后信号可用 0，开盘前信号应使用 1。
+- `maximum_*_age_days`：导出快照时允许使用的最大数据年龄。
+- `minimum_symbol_coverage`：整个请求区间内的证券最低覆盖率；它不是逐截面覆盖率或 Alpha 有效性证明。
+
 ### 选股
 
 - `top_n`：默认 20。越小个股风险越集中，越大则信号稀释、交易笔数增加。
@@ -402,7 +428,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 - 指数历史成分降低了幸存者偏差，但不能消除指数编制本身的选择偏差。
 - 分红送股已进入股份账本，但个人红利税与持有期相关，复杂税务仍需券商级清算数据。
 - 普通现金分红、送股和退市已处理；配股、换股吸收合并、破产重整等特殊事件仍需扩展。
-- 默认因子仍全部来自价格路径；成交额只做可交易性过滤，市值只用于风格控制，没有基本面质量、估值或盈利修正。v1.6 协方差是长-only 收缩最小方差近似，不是完整 Barra 风险模型或精确二次规划器。
+- 生产默认因子仍全部来自价格路径；V2.0 Alpha 1 虽已提供 PIT 财报/估值输入层，但还没有经过因子层 IC、分组、消融和滚动验证，也未进入生产选股。v1.6 协方差是长-only 收缩最小方差近似，不是完整 Barra 风险模型或精确二次规划器。
 - 申万行业成员和每日市值依赖数据源历史覆盖与修订；下载后的 v4 缓存与 `reproducibility.json` 必须和结果一起归档。
 - 行业/市值残差化是截面线性控制，不等于 Barra 类多因子风险模型，也不保证实际组合暴露严格为零。
 - 默认基准已切换为全收益指数，但实际数据源是否完整仍应通过 `validate-data` 确认。
@@ -418,7 +444,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 python -m unittest discover -s tests -v
 ```
 
-当前包含 83 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、数据/缓存完整性、未来数据隔离、冻结 Alpha 对照、排名缓冲、行业/单股约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、公司行动、研究封存，以及 v1.6 协方差分散/历史不足回退/防前视、换手平滑、冲击单调性/上限、组合可行性、容量部分成交与三日重试、低于整手容量拒单、订单审计、CLI 参数路由、严格/公开四臂归因、公开冲击成本账本和公开产物 SHA256 封存。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
+当前包含 110 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、数据/缓存完整性、未来数据隔离、冻结 Alpha 对照、排名缓冲、行业/单股约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、公司行动、研究封存，以及 v1.6 协方差分散/历史不足回退/防前视、换手平滑、冲击单调性/上限、组合可行性、容量部分成交与三日重试、低于整手容量拒单、订单审计、CLI 参数路由、严格/公开四臂归因、公开冲击成本账本和公开产物 SHA256 封存。V2 另覆盖公告/修订可见性、未来值扰动隔离、指标/单位契约、PIT 分区/证券身份与基础行情绑定、下载续传封存、确定性数据指纹、配置迁移、严格标量类型、版本锁一致性和快照 SHA256。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
 
 ## 九、项目结构
 
@@ -433,6 +459,8 @@ a_share_quant/
 ├── V1.5.1_GOVERNANCE.md # 默认回退、晋级状态、数据覆盖审计和 v1.6 边界
 ├── V1.6_PORTFOLIO_EXECUTION.md # 组合/成交公式、冻结参数、归因和晋级边界
 ├── V1.6_VALIDATION.md # 自动化验收、合成四臂结果和真实数据复核命令
+├── V2.0_ALPHA1_PIT_DATA.md # PIT 财报/估值契约、可见性和使用方式
+├── V2.0_ALPHA1_VALIDATION.md # 第一阶段自动化验收与 v1.6 回归
 ├── V1.4_TRUSTWORTHINESS.md
 ├── V1.2_VALIDATION.md  # 改造验收、合成对照和压力结果
 ├── src/ashare_quant/
@@ -441,13 +469,17 @@ a_share_quant/
 │   ├── cli.py          # 命令行入口
 │   ├── config.py       # 配置与参数校验
 │   ├── data.py         # Tushare 下载、缓存、数据校验、离线演示
+│   ├── pit_data.py     # V2 PIT 财报/估值下载、封存、校验和快照
 │   ├── factors.py      # 因子、动态成分、选股、风险开关与权重
 │   ├── portfolio.py    # 逆波动率基线、收缩协方差和换手平滑
 │   ├── execution.py    # 固定滑点/平方根冲击公式与模型治理
 │   ├── provenance.py   # 数据、代码、配置与环境指纹
 │   ├── report.py       # 指标、暴露、CSV、PNG 和 HTML 报告
 │   └── research.py     # Alpha、组合/成交归因、消融、成本压力和滚动评估
-└── tests/test_quant.py
+└── tests/
+    ├── test_quant.py
+    ├── test_public_research.py
+    └── test_pit_data.py
 ```
 
 ## 十、规则与数据接口参考
@@ -461,6 +493,10 @@ a_share_quant/
 - [Tushare 分红送股 `dividend`](https://tushare.pro/wctapi/documents/103.md)
 - [Tushare 股票基础信息与退市日期 `stock_basic`](https://tushare.pro/document/2?doc_id=25)
 - [Tushare 每日指标与总/流通市值 `daily_basic`](https://tushare.pro/document/2?doc_id=32)
+- [Tushare 利润表 `income`](https://tushare.pro/document/2?doc_id=33)
+- [Tushare 资产负债表 `balancesheet`](https://tushare.pro/document/2?doc_id=36)
+- [Tushare 现金流量表 `cashflow`](https://tushare.pro/document/2?doc_id=44)
+- [Tushare 财务指标 `fina_indicator`](https://tushare.pro/document/2?doc_id=79)
 - [Tushare 申万行业分类 `index_classify`](https://tushare.pro/document/2?doc_id=181)
 - [Tushare 申万行业历史成员 `index_member_all`](https://tushare.pro/document/2?doc_id=335)
 - [中证指数沪深 300 资料：全收益指数 H00300](https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/indices/detail/files/zh_CN/000300factsheet.pdf)

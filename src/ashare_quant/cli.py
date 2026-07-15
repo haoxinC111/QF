@@ -1,19 +1,33 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
+from datetime import UTC, datetime
 from dataclasses import asdict, replace
 from pathlib import Path
+
+import pandas as pd
 
 from .backtest import Backtester
 from .config import AppConfig, BacktestConfig
 from .data import MarketDataBundle, TushareDownloader, make_demo_bundle
 from .execution import SUPPORTED_EXECUTION_MODELS
 from .portfolio import SUPPORTED_PORTFOLIO_MODELS
+from .pit_data import (
+    PointInTimeDataBundle,
+    TusharePointInTimeDownloader,
+    verify_pit_cache,
+)
 from .report import console_summary, write_report
 from .research import write_research_suite
-from .provenance import ARTIFACT_MANIFEST_FILENAME, verify_artifact_manifest
+from .provenance import (
+    ARTIFACT_MANIFEST_FILENAME,
+    sha256_file,
+    verify_artifact_manifest,
+)
 from .public_research import (
     PublicDownloadConfig,
     PublicStrategyConfig,
@@ -40,6 +54,35 @@ def _parser() -> argparse.ArgumentParser:
     ]:
         child = subparsers.add_parser(command, help=help_text)
         child.add_argument("--config", default="config.yaml", help="YAML 配置文件")
+
+    pit_download = subparsers.add_parser(
+        "pit-download", help="下载并封存 V2 财报/估值时点数据侧车"
+    )
+    pit_download.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+
+    pit_verify = subparsers.add_parser(
+        "pit-verify", help="校验 PIT 缓存、基础行情身份与证券覆盖率"
+    )
+    pit_verify.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+
+    pit_snapshot = subparsers.add_parser(
+        "pit-snapshot", help="导出指定日期真正可见的财报/估值快照"
+    )
+    pit_snapshot.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+    pit_snapshot.add_argument("--date", required=True, help="快照日期 YYYY-MM-DD")
+    pit_snapshot.add_argument(
+        "--symbols", help="可选，逗号分隔的证券代码（例如 600000.SH,000001.SZ）"
+    )
+    pit_snapshot.add_argument("--output", help="可选 CSV 输出路径")
+    pit_snapshot.add_argument(
+        "--force", action="store_true", help="允许覆盖既有快照及其元数据"
+    )
 
     research = subparsers.add_parser(
         "research", help="运行 Alpha、组合/成交归因、成本压力和滚动评估"
@@ -171,6 +214,53 @@ def _run_backtest(
     )
     print(console_summary(metrics))
     print(f"完整报告: {Path(config.backtest.output_dir) / 'report.html'}")
+
+
+def _pit_bundle(config: AppConfig) -> PointInTimeDataBundle:
+    if not config.point_in_time.enabled:
+        raise ValueError(
+            "PIT 数据未启用；请在 point_in_time.enabled 设置为 true"
+        )
+    return PointInTimeDataBundle.from_cache(
+        config.point_in_time.cache_dir,
+        strict=True,
+        expected_config=config,
+        base_manifest_path=Path(config.data.cache_dir) / "manifest.json",
+    )
+
+
+def _write_snapshot(
+    snapshot: pd.DataFrame,
+    output_text: str,
+    *,
+    force: bool,
+    metadata: dict[str, object],
+) -> tuple[Path, Path]:
+    # Kept local to the CLI because this is a derived inspection artifact, not
+    # part of the immutable PIT cache itself.
+    output = Path(output_text).resolve()
+    metadata_path = output.with_name(output.name + ".manifest.json")
+    if not force and (output.exists() or metadata_path.exists()):
+        raise FileExistsError(
+            f"快照输出已存在，拒绝覆盖；如确认请加 --force: {output}"
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.name + ".tmp")
+    snapshot.to_csv(temporary, index=False)
+    os.replace(temporary, output)
+    payload = {
+        **metadata,
+        "created_at_utc": datetime.now(UTC).isoformat(),
+        "snapshot_file": output.name,
+        "snapshot_rows": len(snapshot),
+        "snapshot_sha256": sha256_file(output),
+    }
+    metadata_temporary = metadata_path.with_name(metadata_path.name + ".tmp")
+    metadata_temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(metadata_temporary, metadata_path)
+    return output, metadata_path
 
 
 def _dispatch(args: argparse.Namespace) -> int:
@@ -306,6 +396,78 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     config = _load_config(args.config)
+    if args.command == "pit-download":
+        bundle = TusharePointInTimeDownloader(config).download()
+        quality = bundle.manifest["data_quality"]
+        print(
+            "PIT 数据完成: "
+            f"财报 {quality['fundamental_rows']:,} 行/"
+            f"{quality['fundamental_symbols']} 只，"
+            f"估值 {quality['valuation_rows']:,} 行/"
+            f"{quality['valuation_symbols']} 只，"
+            f"指纹 {bundle.manifest['data_fingerprint_sha256']}"
+        )
+        return 0
+    if args.command == "pit-verify":
+        if not config.point_in_time.enabled:
+            raise ValueError(
+                "PIT 数据未启用；请在 point_in_time.enabled 设置为 true"
+            )
+        manifest = verify_pit_cache(
+            config.point_in_time.cache_dir,
+            expected_config=config,
+            base_manifest_path=Path(config.data.cache_dir) / "manifest.json",
+        )
+        quality = manifest["data_quality"]
+        print(
+            "PIT 缓存校验通过: "
+            f"财报覆盖 {quality['fundamental_symbol_coverage']:.2%}，"
+            f"估值覆盖 {quality['valuation_symbol_coverage']:.2%}，"
+            f"指纹 {manifest['data_fingerprint_sha256']}"
+        )
+        return 0
+    if args.command == "pit-snapshot":
+        bundle = _pit_bundle(config)
+        symbols = (
+            [value.strip() for value in args.symbols.split(",") if value.strip()]
+            if args.symbols
+            else None
+        )
+        snapshot = bundle.snapshot(
+            args.date,
+            symbols=symbols,
+            maximum_fundamental_age_days=(
+                config.point_in_time.maximum_fundamental_age_days
+            ),
+            maximum_valuation_age_days=(
+                config.point_in_time.maximum_valuation_age_days
+            ),
+        )
+        if args.output:
+            output, metadata_path = _write_snapshot(
+                snapshot,
+                args.output,
+                force=args.force,
+                metadata={
+                    "schema_version": 1,
+                    "as_of_date": str(args.date),
+                    "requested_symbols": symbols,
+                    "pit_data_fingerprint_sha256": bundle.manifest.get(
+                        "data_fingerprint_sha256"
+                    ),
+                    "base_data_fingerprint_sha256": bundle.manifest.get(
+                        "base_data_fingerprint_sha256"
+                    ),
+                },
+            )
+            print(
+                f"PIT 快照完成: {len(snapshot)} 行，{output}，"
+                f"SHA256 {sha256_file(output)}，元数据 {metadata_path}"
+            )
+        else:
+            print(snapshot.head(20).to_string(index=False))
+            print(f"PIT 快照: {len(snapshot)} 行（终端最多显示 20 行）")
+        return 0
     if args.command == "download":
         bundle = TushareDownloader(config).download()
         print(
@@ -319,12 +481,21 @@ def _dispatch(args: argparse.Namespace) -> int:
             strict=config.data.strict_validation,
             expected_config=config,
         )
-        print(
+        summary = (
             f"校验通过: {bundle.bars['symbol'].nunique()} 只股票，"
             f"{len(bundle.bars):,} 行日线，{len(bundle.membership):,} 条成分记录，"
             f"{len(bundle.industry_membership):,} 条行业区间，"
             f"{len(bundle.corporate_actions):,} 条公司行动"
         )
+        if config.point_in_time.enabled:
+            pit_bundle = _pit_bundle(config)
+            quality = pit_bundle.manifest["data_quality"]
+            summary += (
+                "；PIT 财报/估值覆盖 "
+                f"{quality['fundamental_symbol_coverage']:.2%}/"
+                f"{quality['valuation_symbol_coverage']:.2%}"
+            )
+        print(summary)
         return 0
     if args.command == "research":
         bundle = MarketDataBundle.from_cache(
@@ -378,6 +549,6 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         return _dispatch(args)
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
