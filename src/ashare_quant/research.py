@@ -17,6 +17,16 @@ from .alpha import (
 from .backtest import Backtester
 from .config import AppConfig
 from .data import MarketDataBundle
+from .execution import (
+    DEFAULT_EXECUTION_MODEL,
+    EXECUTION_MODEL_V1_6,
+    execution_model_governance,
+)
+from .portfolio import (
+    DEFAULT_PORTFOLIO_MODEL,
+    PORTFOLIO_MODEL_V1_6,
+    portfolio_model_governance,
+)
 from .report import calculate_metrics
 from .provenance import (
     build_reproducibility_manifest,
@@ -147,6 +157,57 @@ def run_cost_stress(
     return pd.DataFrame(records)
 
 
+def run_implementation_comparison(
+    bundle: MarketDataBundle,
+    config: AppConfig,
+) -> pd.DataFrame:
+    """Attribute portfolio and execution changes without changing Alpha."""
+    cases = [
+        (
+            "baseline_v1_5_1",
+            DEFAULT_PORTFOLIO_MODEL,
+            DEFAULT_EXECUTION_MODEL,
+        ),
+        (
+            "portfolio_only_v1_6",
+            PORTFOLIO_MODEL_V1_6,
+            DEFAULT_EXECUTION_MODEL,
+        ),
+        (
+            "execution_only_v1_6",
+            DEFAULT_PORTFOLIO_MODEL,
+            EXECUTION_MODEL_V1_6,
+        ),
+        (
+            "combined_v1_6",
+            PORTFOLIO_MODEL_V1_6,
+            EXECUTION_MODEL_V1_6,
+        ),
+    ]
+    records: list[dict[str, object]] = []
+    for variant, portfolio_model, execution_model in cases:
+        case_config = replace(
+            config,
+            portfolio=replace(
+                config.portfolio,
+                construction_model=portfolio_model,
+            ),
+            execution=replace(
+                config.execution,
+                market_impact_model=execution_model,
+            ),
+        )
+        records.append(
+            {
+                "variant": variant,
+                "portfolio_model": portfolio_model,
+                "execution_model": execution_model,
+                **_run_metrics(bundle, case_config),
+            }
+        )
+    return pd.DataFrame(records)
+
+
 def run_rolling_oos(
     bundle: MarketDataBundle,
     config: AppConfig,
@@ -202,14 +263,20 @@ def write_research_suite(
     bundle: MarketDataBundle,
     config: AppConfig,
     output_dir: str | Path,
-    modes: Iterable[str] = ("alpha", "ablation", "cost", "rolling"),
+    modes: Iterable[str] = (
+        "alpha",
+        "ablation",
+        "cost",
+        "rolling",
+        "implementation",
+    ),
     slippage_bps: Sequence[float] = (5.0, 10.0, 20.0),
     commission_multipliers: Sequence[float] = (1.0, 2.0),
     train_years: int = 5,
     test_years: int = 1,
 ) -> dict[str, Path]:
     requested = list(dict.fromkeys(str(mode).strip().lower() for mode in modes))
-    supported = {"alpha", "ablation", "cost", "rolling"}
+    supported = {"alpha", "ablation", "cost", "rolling", "implementation"}
     unknown = sorted(set(requested).difference(supported))
     if unknown:
         raise ValueError("未知研究模式: " + ", ".join(unknown))
@@ -245,6 +312,10 @@ def write_research_suite(
             test_years=test_years,
         ).to_csv(path, index=False)
         written["rolling"] = path
+    if "implementation" in requested:
+        path = output / "implementation_comparison.csv"
+        run_implementation_comparison(bundle, config).to_csv(path, index=False)
+        written["implementation"] = path
 
     manifest = {
         "modes": requested,
@@ -264,6 +335,28 @@ def write_research_suite(
             ALPHA_MODEL_VERSION: alpha_profile_governance(ALPHA_MODEL_VERSION),
         },
         "default_alpha_profile": DEFAULT_ALPHA_PROFILE,
+        "implementation_models": {
+            "portfolio": {
+                DEFAULT_PORTFOLIO_MODEL: portfolio_model_governance(
+                    DEFAULT_PORTFOLIO_MODEL
+                ),
+                PORTFOLIO_MODEL_V1_6: portfolio_model_governance(
+                    PORTFOLIO_MODEL_V1_6
+                ),
+            },
+            "execution": {
+                DEFAULT_EXECUTION_MODEL: execution_model_governance(
+                    DEFAULT_EXECUTION_MODEL
+                ),
+                EXECUTION_MODEL_V1_6: execution_model_governance(
+                    EXECUTION_MODEL_V1_6
+                ),
+            },
+        },
+        "implementation_attribution": (
+            "四臂对照固定 Alpha 和其余配置，仅分别切换组合模型与成交模型；"
+            "实验模型在绑定真实数据指纹验证前不自动晋级。"
+        ),
         "ablation_interpretation": (
             "删除因子后剩余权重会重新归一化；结果只表示当前组合下的边际证据，"
             "不能解释为单因子的独立因果贡献。"

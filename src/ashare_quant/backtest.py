@@ -8,6 +8,7 @@ import pandas as pd
 
 from .config import AppConfig
 from .data import MarketDataBundle
+from .execution import DEFAULT_EXECUTION_MODEL, market_impact_bps
 from .factors import MultiFactorStrategy, SignalPlan
 
 
@@ -67,8 +68,23 @@ class PendingRebalance:
     target_shares: dict[str, float]
     remaining: set[str]
     liquidity: dict[str, float]
+    volatility: dict[str, float]
     reserve_cash: float
     attempts: int = 0
+
+
+@dataclass(frozen=True)
+class ExecutionQuote:
+    reference_price: float
+    price: float
+    lagged_adv20: float
+    participation_cap_notional: float
+    participation_rate: float
+    signal_volatility: float
+    fixed_slippage_bps: float
+    market_impact_bps: float
+    modeled_slippage_bps: float
+    realized_slippage_bps: float
 
 
 @dataclass
@@ -87,7 +103,11 @@ class Backtester:
         config.validate()
         self.bundle = bundle.prepare(strict=config.data.strict_validation)
         self.config = config
-        self.strategy = MultiFactorStrategy(self.bundle, config.strategy)
+        self.strategy = MultiFactorStrategy(
+            self.bundle,
+            config.strategy,
+            config.portfolio,
+        )
         self.cash = float(config.backtest.initial_cash)
         self.positions: dict[str, Position] = {}
         self.receivables: list[DividendReceivable] = []
@@ -148,6 +168,11 @@ class Backtester:
             if index > 0:
                 self._accrue_cash_interest()
             self._apply_delistings(date)
+            current_weights = (
+                self._current_weights_at_recorded_close(schedule[date])
+                if date in schedule
+                else {}
+            )
             self._apply_corporate_actions(date)
             self._settle_dividends(date)
             if date in schedule:
@@ -159,7 +184,9 @@ class Backtester:
                     if position.total_shares > 1e-12
                 }
                 plan = self.strategy.generate(
-                    schedule[date], current_holdings=current_holdings
+                    schedule[date],
+                    current_holdings=current_holdings,
+                    current_weights=current_weights,
                 )
                 if not plan.selection.empty:
                     selection = plan.selection.copy()
@@ -232,11 +259,16 @@ class Backtester:
             target_shares[symbol] = self._floor_lot(value / reference_price)
         remaining = set(self.positions).union(target_shares)
         liquidity: dict[str, float] = {}
+        volatility: dict[str, float] = {}
         for symbol in remaining:
             value = plan.liquidity.get(symbol, np.nan)
             if not np.isfinite(value) or value <= 0:
                 value = self.strategy.trailing_amount(symbol, plan.signal_date)
             liquidity[symbol] = float(value) if np.isfinite(value) else np.inf
+            risk = plan.volatility.get(symbol, np.nan)
+            if not np.isfinite(risk) or risk <= 0:
+                risk = self.strategy.trailing_volatility(symbol, plan.signal_date)
+            volatility[symbol] = float(risk) if np.isfinite(risk) else np.nan
         self.pending = PendingRebalance(
             plan=plan,
             first_execution_date=execution_date,
@@ -245,6 +277,7 @@ class Backtester:
             target_shares=target_shares,
             remaining=remaining,
             liquidity=liquidity,
+            volatility=volatility,
             reserve_cash=signal_equity * self.config.execution.cash_buffer,
         )
 
@@ -293,28 +326,71 @@ class Backtester:
         desired = max(0.0, position.total_shares - target)
         sellable = position.sellable_shares(date)
         if sellable <= 1e-12:
-            self._record_order(pending, date, symbol, "SELL", "REJECTED", "T+1", 0, 0, 0, 0)
+            self._record_order(
+                pending,
+                date,
+                symbol,
+                "SELL",
+                "REJECTED",
+                "T+1",
+                0,
+                0,
+                0,
+                0,
+                requested_shares=desired,
+            )
             return
         bar, rejection = self._execution_bar(symbol, date, "SELL")
         if rejection:
-            self._record_order(pending, date, symbol, "SELL", "REJECTED", rejection, 0, 0, 0, 0)
+            self._record_order(
+                pending,
+                date,
+                symbol,
+                "SELL",
+                "REJECTED",
+                rejection,
+                0,
+                0,
+                0,
+                0,
+                requested_shares=desired,
+            )
             return
         assert bar is not None
-        slippage = self.config.execution.slippage_bps / 10_000.0
-        price = max(float(bar["down_limit"]), float(bar["open"]) * (1.0 - slippage))
+        if self._requires_missing_liquidity_rejection(pending, symbol):
+            self._record_order(
+                pending,
+                date,
+                symbol,
+                "SELL",
+                "REJECTED",
+                "missing_signal_liquidity",
+                0,
+                0,
+                0,
+                0,
+                requested_shares=desired,
+            )
+            return
+        reference_price = float(bar["open"])
         participation_cap = self._participation_cap(pending, symbol)
-        cap_shares = participation_cap / max(price, 1e-12)
+        capacity_price = (
+            self._execution_quote(pending, symbol, bar, "SELL", 0.0).price
+            if self.config.execution.market_impact_model == DEFAULT_EXECUTION_MODEL
+            else reference_price
+        )
+        cap_shares = participation_cap / max(capacity_price, 1e-12)
         desired = min(desired, sellable)
         full_exit = (
             target <= 1e-8
             and desired >= position.total_shares - 1e-8
-            and desired * price <= participation_cap + 1e-8
+            and desired * capacity_price <= participation_cap + 1e-8
         )
         odd_component = position.total_shares % self.config.execution.lot_size
         odd_cleanup = (
             desired > 1e-8
             and desired <= odd_component + 1e-8
-            and desired * price <= participation_cap + 1e-8
+            and desired * capacity_price <= participation_cap + 1e-8
         )
         shares = (
             desired
@@ -323,11 +399,27 @@ class Backtester:
         )
         if shares <= 0:
             reason = "below_lot" if desired < self.config.execution.lot_size else "participation_cap"
-            self._record_order(pending, date, symbol, "SELL", "REJECTED", reason, 0, price, 0, 0)
+            quote = self._execution_quote(pending, symbol, bar, "SELL", 0.0)
+            self._record_order(
+                pending,
+                date,
+                symbol,
+                "SELL",
+                "REJECTED",
+                reason,
+                0,
+                quote.price,
+                0,
+                0,
+                requested_shares=desired,
+                quote=quote,
+            )
             if reason == "below_lot" and target > 0:
                 pending.remaining.discard(symbol)
             return
 
+        quote = self._execution_quote(pending, symbol, bar, "SELL", shares)
+        price = quote.price
         shares = position.remove_sellable(shares, date)
         notional = shares * price
         fees = self._fees(notional, "SELL", date)
@@ -339,7 +431,20 @@ class Backtester:
         remaining_gap = max(0.0, self._shares(symbol) - target)
         partial = remaining_gap >= self.config.execution.lot_size - 1e-8
         status = "PARTIAL" if partial else "FILLED"
-        self._record_order(pending, date, symbol, "SELL", status, "", shares, price, notional, fees)
+        self._record_order(
+            pending,
+            date,
+            symbol,
+            "SELL",
+            status,
+            "",
+            shares,
+            price,
+            notional,
+            fees,
+            requested_shares=desired,
+            quote=quote,
+        )
         self.trade_records.append(self.order_records[-1].copy())
         if not partial:
             pending.remaining.discard(symbol)
@@ -347,35 +452,123 @@ class Backtester:
     def _execute_buy(
         self, symbol: str, date: pd.Timestamp, pending: PendingRebalance
     ) -> None:
+        desired = max(
+            0.0,
+            pending.target_shares.get(symbol, 0.0) - self._shares(symbol),
+        )
         bar, rejection = self._execution_bar(symbol, date, "BUY")
         if rejection:
-            self._record_order(pending, date, symbol, "BUY", "REJECTED", rejection, 0, 0, 0, 0)
+            self._record_order(
+                pending,
+                date,
+                symbol,
+                "BUY",
+                "REJECTED",
+                rejection,
+                0,
+                0,
+                0,
+                0,
+                requested_shares=desired,
+            )
             return
         assert bar is not None
-        desired = max(0.0, pending.target_shares.get(symbol, 0.0) - self._shares(symbol))
-        slippage = self.config.execution.slippage_bps / 10_000.0
-        price = min(float(bar["up_limit"]), float(bar["open"]) * (1.0 + slippage))
+        if self._requires_missing_liquidity_rejection(pending, symbol):
+            self._record_order(
+                pending,
+                date,
+                symbol,
+                "BUY",
+                "REJECTED",
+                "missing_signal_liquidity",
+                0,
+                0,
+                0,
+                0,
+                requested_shares=desired,
+            )
+            return
+        reference_price = float(bar["open"])
         participation_cap = self._participation_cap(pending, symbol)
-        shares = self._floor_lot(min(desired, participation_cap / max(price, 1e-12)))
+        capacity_price = (
+            self._execution_quote(pending, symbol, bar, "BUY", 0.0).price
+            if self.config.execution.market_impact_model == DEFAULT_EXECUTION_MODEL
+            else reference_price
+        )
+        shares = self._floor_lot(
+            min(desired, participation_cap / max(capacity_price, 1e-12))
+        )
         if shares <= 0:
-            self._record_order(pending, date, symbol, "BUY", "REJECTED", "below_lot", 0, price, 0, 0)
-            pending.remaining.discard(symbol)
+            reason = (
+                "below_lot"
+                if desired < self.config.execution.lot_size
+                else "participation_cap"
+            )
+            quote = self._execution_quote(pending, symbol, bar, "BUY", 0.0)
+            self._record_order(
+                pending,
+                date,
+                symbol,
+                "BUY",
+                "REJECTED",
+                reason,
+                0,
+                quote.price,
+                0,
+                0,
+                requested_shares=desired,
+                quote=quote,
+            )
+            if reason == "below_lot":
+                pending.remaining.discard(symbol)
             return
 
         available_cash = max(0.0, self.cash - pending.reserve_cash)
-        shares = min(shares, self._affordable_shares(available_cash, price, shares, date))
+        quote = self._execution_quote(pending, symbol, bar, "BUY", shares)
+        affordable = self._affordable_shares(
+            available_cash,
+            quote.price,
+            shares,
+            date,
+        )
+        if affordable < shares:
+            shares = affordable
+            quote = self._execution_quote(pending, symbol, bar, "BUY", shares)
         if shares <= 0:
             self._record_order(
-                pending, date, symbol, "BUY", "REJECTED", "insufficient_cash", 0, price, 0, 0
+                pending,
+                date,
+                symbol,
+                "BUY",
+                "REJECTED",
+                "insufficient_cash",
+                0,
+                quote.price,
+                0,
+                0,
+                requested_shares=desired,
+                quote=quote,
             )
             return
 
+        price = quote.price
         notional = shares * price
         fees = self._fees(notional, "BUY", date)
         total_cost = notional + fees
         if total_cost > available_cash + 1e-8:
             self._record_order(
-                pending, date, symbol, "BUY", "REJECTED", "insufficient_cash", 0, price, 0, 0
+                pending,
+                date,
+                symbol,
+                "BUY",
+                "REJECTED",
+                "insufficient_cash",
+                0,
+                price,
+                0,
+                0,
+                requested_shares=desired,
+                quote=quote,
             )
             return
         position = self.positions.setdefault(symbol, Position())
@@ -393,7 +586,20 @@ class Backtester:
         remaining_gap = max(0.0, pending.target_shares.get(symbol, 0.0) - position.total_shares)
         partial = remaining_gap >= self.config.execution.lot_size - 1e-8
         status = "PARTIAL" if partial else "FILLED"
-        self._record_order(pending, date, symbol, "BUY", status, "", shares, price, notional, fees)
+        self._record_order(
+            pending,
+            date,
+            symbol,
+            "BUY",
+            status,
+            "",
+            shares,
+            price,
+            notional,
+            fees,
+            requested_shares=desired,
+            quote=quote,
+        )
         self.trade_records.append(self.order_records[-1].copy())
         if not partial:
             pending.remaining.discard(symbol)
@@ -535,10 +741,51 @@ class Backtester:
         price: float,
         notional: float,
         fees: float,
+        *,
+        requested_shares: float | None = None,
+        quote: ExecutionQuote | None = None,
     ) -> None:
         commission, stamp, transfer = (
             self._fee_components(notional, side, date) if notional > 0 else (0.0, 0.0, 0.0)
         )
+        target_shares = float(pending.target_shares.get(symbol, 0.0))
+        requested = (
+            float(requested_shares)
+            if requested_shares is not None
+            else abs(target_shares - self._shares(symbol))
+        )
+        remaining = abs(target_shares - self._shares(symbol))
+        reference_price = quote.reference_price if quote is not None else 0.0
+        lagged_adv20 = (
+            quote.lagged_adv20
+            if quote is not None
+            else float(pending.liquidity.get(symbol, np.nan))
+        )
+        participation_cap = (
+            quote.participation_cap_notional
+            if quote is not None
+            else self._participation_cap(pending, symbol)
+        )
+        signal_volatility = (
+            quote.signal_volatility
+            if quote is not None
+            else float(pending.volatility.get(symbol, np.nan))
+        )
+        fixed_slippage_bps = (
+            quote.fixed_slippage_bps
+            if quote is not None
+            else float(self.config.execution.slippage_bps)
+        )
+        impact_bps = quote.market_impact_bps if quote is not None else 0.0
+        modeled_slippage_bps = (
+            quote.modeled_slippage_bps
+            if quote is not None
+            else fixed_slippage_bps
+        )
+        realized_slippage_bps = (
+            quote.realized_slippage_bps if quote is not None else 0.0
+        )
+        reference_notional = float(reference_price) * float(shares)
         self.order_records.append(
             {
                 "signal_date": pending.plan.signal_date,
@@ -548,9 +795,35 @@ class Backtester:
                 "side": side,
                 "status": status,
                 "reason": reason,
-                "target_shares": float(pending.target_shares.get(symbol, 0.0)),
+                "portfolio_model": pending.plan.portfolio_model,
+                "portfolio_status": pending.plan.portfolio_status,
+                "execution_model": self.config.execution.market_impact_model,
+                "target_shares": target_shares,
+                "requested_shares": requested,
                 "shares": float(shares),
+                "remaining_shares": float(remaining),
+                "fill_ratio": float(shares / requested) if requested > 0 else 0.0,
+                "reference_price": float(reference_price),
                 "price": float(price),
+                "lagged_adv20": float(lagged_adv20),
+                "participation_cap_notional": float(participation_cap),
+                "participation_rate": (
+                    float(quote.participation_rate) if quote is not None else 0.0
+                ),
+                "signal_volatility": float(signal_volatility),
+                "fixed_slippage_bps": float(fixed_slippage_bps),
+                "market_impact_bps": float(impact_bps),
+                "modeled_slippage_bps": float(modeled_slippage_bps),
+                "realized_slippage_bps": float(realized_slippage_bps),
+                "estimated_fixed_slippage_cost": (
+                    reference_notional * fixed_slippage_bps / 10_000.0
+                ),
+                "estimated_market_impact_cost": (
+                    reference_notional * impact_bps / 10_000.0
+                ),
+                "realized_slippage_cost": (
+                    reference_notional * realized_slippage_bps / 10_000.0
+                ),
                 "notional": float(notional),
                 "commission": float(commission),
                 "stamp_duty": float(stamp),
@@ -632,6 +905,22 @@ class Backtester:
                 return float(record["nav"])
         raise ValueError(f"找不到信号日 {date.date()} 的组合净值")
 
+    def _current_weights_at_recorded_close(
+        self, date: pd.Timestamp
+    ) -> dict[str, float]:
+        equity = self._equity_at_recorded_close(date)
+        if equity <= 0:
+            return {}
+        weights: dict[str, float] = {}
+        for symbol, position in self.positions.items():
+            try:
+                close = float(self.close_marks.at[date, symbol])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite(close) and close > 0 and position.total_shares > 0:
+                weights[symbol] = position.total_shares * close / equity
+        return weights
+
     def _shares(self, symbol: str) -> float:
         position = self.positions.get(symbol)
         return position.total_shares if position is not None else 0.0
@@ -644,6 +933,63 @@ class Backtester:
         if not np.isfinite(amount) or amount <= 0:
             return np.inf
         return float(amount) * rate
+
+    def _requires_missing_liquidity_rejection(
+        self, pending: PendingRebalance, symbol: str
+    ) -> bool:
+        if self.config.execution.market_impact_model == DEFAULT_EXECUTION_MODEL:
+            return False
+        amount = float(pending.liquidity.get(symbol, np.nan))
+        return not np.isfinite(amount) or amount <= 0
+
+    def _execution_quote(
+        self,
+        pending: PendingRebalance,
+        symbol: str,
+        bar: pd.Series,
+        side: str,
+        shares: float,
+    ) -> ExecutionQuote:
+        reference_price = float(bar["open"])
+        amount = float(pending.liquidity.get(symbol, np.nan))
+        participation = (
+            max(0.0, float(shares) * reference_price / amount)
+            if np.isfinite(amount) and amount > 0
+            else 0.0
+        )
+        signal_volatility = float(pending.volatility.get(symbol, np.nan))
+        impact = market_impact_bps(
+            model=self.config.execution.market_impact_model,
+            annualized_volatility=signal_volatility,
+            participation_rate=participation,
+            coefficient=self.config.execution.market_impact_coefficient,
+            annualized_volatility_floor=(
+                self.config.execution.market_impact_volatility_floor
+            ),
+            maximum_bps=self.config.execution.max_market_impact_bps,
+        )
+        fixed = float(self.config.execution.slippage_bps)
+        modeled = fixed + impact
+        direction = 1.0 if side == "BUY" else -1.0
+        unconstrained = reference_price * (1.0 + direction * modeled / 10_000.0)
+        if side == "BUY":
+            price = min(float(bar["up_limit"]), unconstrained)
+            realized = max(0.0, (price / reference_price - 1.0) * 10_000.0)
+        else:
+            price = max(float(bar["down_limit"]), unconstrained)
+            realized = max(0.0, (1.0 - price / reference_price) * 10_000.0)
+        return ExecutionQuote(
+            reference_price=reference_price,
+            price=float(price),
+            lagged_adv20=amount,
+            participation_cap_notional=self._participation_cap(pending, symbol),
+            participation_rate=float(participation),
+            signal_volatility=signal_volatility,
+            fixed_slippage_bps=fixed,
+            market_impact_bps=float(impact),
+            modeled_slippage_bps=float(modeled),
+            realized_slippage_bps=float(realized),
+        )
 
     def _floor_lot(self, shares: float) -> float:
         lot = self.config.execution.lot_size

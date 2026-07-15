@@ -14,6 +14,14 @@ from .alpha import (
     alpha_profile_weights,
     identify_alpha_profile,
 )
+from .execution import (
+    DEFAULT_EXECUTION_MODEL,
+    SUPPORTED_EXECUTION_MODELS,
+)
+from .portfolio import (
+    DEFAULT_PORTFOLIO_MODEL,
+    SUPPORTED_PORTFOLIO_MODELS,
+)
 
 
 _FACTOR_CONFIG_FIELDS = {
@@ -123,6 +131,17 @@ class StrategyConfig:
 
 
 @dataclass(frozen=True)
+class PortfolioConfig:
+    construction_model: str = DEFAULT_PORTFOLIO_MODEL
+    covariance_lookback_days: int = 120
+    minimum_covariance_observations: int = 60
+    covariance_shrinkage: float = 0.50
+    minimum_variance_blend: float = 0.50
+    turnover_smoothing: float = 0.50
+    covariance_ridge: float = 1e-6
+
+
+@dataclass(frozen=True)
 class FeeScheduleConfig:
     start_date: str
     end_date: str | None
@@ -159,6 +178,10 @@ class ExecutionConfig:
     minimum_commission: float = 5.0
     fee_schedule: tuple[FeeScheduleConfig, ...] = field(default_factory=_default_fee_schedule)
     slippage_bps: float = 5.0
+    market_impact_model: str = DEFAULT_EXECUTION_MODEL
+    market_impact_coefficient: float = 0.50
+    market_impact_volatility_floor: float = 0.10
+    max_market_impact_bps: float = 50.0
     cash_buffer: float = 0.02
     max_participation_of_20d_amount: float = 0.05
     rebalance_retry_days: int = 3
@@ -177,6 +200,7 @@ class AppConfig:
     data: DataConfig = field(default_factory=DataConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    portfolio: PortfolioConfig = field(default_factory=PortfolioConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
     @classmethod
@@ -248,6 +272,7 @@ class AppConfig:
                 }
             ),
             strategy=StrategyConfig(**strategy_values),
+            portfolio=PortfolioConfig(**dict(raw.get("portfolio", {}))),
             execution=ExecutionConfig(**execution_values, fee_schedule=fee_schedule),
         )
         config.validate()
@@ -300,6 +325,33 @@ class AppConfig:
             raise ValueError("max_industry_weight 必须在 (0, 1] 内")
         if not 0 <= self.strategy.size_neutralization_strength <= 1:
             raise ValueError("size_neutralization_strength 必须在 [0, 1] 内")
+        if self.portfolio.construction_model not in SUPPORTED_PORTFOLIO_MODELS:
+            raise ValueError(
+                "construction_model 仅支持 "
+                + "、".join(sorted(SUPPORTED_PORTFOLIO_MODELS))
+            )
+        if self.portfolio.covariance_lookback_days < 20:
+            raise ValueError("covariance_lookback_days 至少为 20")
+        if not (
+            20
+            <= self.portfolio.minimum_covariance_observations
+            <= self.portfolio.covariance_lookback_days
+        ):
+            raise ValueError(
+                "minimum_covariance_observations 必须在 20 与协方差回看天数之间"
+            )
+        for name, value in {
+            "covariance_shrinkage": self.portfolio.covariance_shrinkage,
+            "minimum_variance_blend": self.portfolio.minimum_variance_blend,
+            "turnover_smoothing": self.portfolio.turnover_smoothing,
+        }.items():
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} 必须在 [0, 1] 内")
+        if not (
+            math.isfinite(self.portfolio.covariance_ridge)
+            and self.portfolio.covariance_ridge > 0
+        ):
+            raise ValueError("covariance_ridge 必须是正有限数")
         if self.data.industry_standard not in {"SW2014", "SW2021"}:
             raise ValueError("industry_standard 仅支持 SW2014 或 SW2021")
         if self.data.industry_level not in {"L1", "L2", "L3"}:
@@ -318,15 +370,43 @@ class AppConfig:
             raise ValueError("全收益业绩基准不能同时作为价格择时指数")
         if self.execution.lot_size <= 0:
             raise ValueError("lot_size 必须大于 0")
-        if min(
-            self.execution.commission_rate,
-            self.execution.minimum_commission,
-            self.execution.slippage_bps,
-            self.execution.max_participation_of_20d_amount,
-        ) < 0:
-            raise ValueError("费用、滑点和成交占比不能为负")
+        if self.execution.market_impact_model not in SUPPORTED_EXECUTION_MODELS:
+            raise ValueError(
+                "market_impact_model 仅支持 "
+                + "、".join(sorted(SUPPORTED_EXECUTION_MODELS))
+            )
+        execution_parameters = {
+            "commission_rate": self.execution.commission_rate,
+            "minimum_commission": self.execution.minimum_commission,
+            "slippage_bps": self.execution.slippage_bps,
+            "max_participation_of_20d_amount": (
+                self.execution.max_participation_of_20d_amount
+            ),
+            "market_impact_coefficient": (
+                self.execution.market_impact_coefficient
+            ),
+            "market_impact_volatility_floor": (
+                self.execution.market_impact_volatility_floor
+            ),
+            "max_market_impact_bps": self.execution.max_market_impact_bps,
+        }
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in execution_parameters.values()
+        ):
+            raise ValueError("费用、滑点、冲击参数和成交占比必须为非负有限数")
+        if self.execution.max_participation_of_20d_amount > 1:
+            raise ValueError("max_participation_of_20d_amount 不能大于 1")
+        if (
+            self.execution.slippage_bps
+            + self.execution.max_market_impact_bps
+            >= 10_000
+        ):
+            raise ValueError("滑点与最大市场冲击之和必须小于 10000 bps")
         if not 0 <= self.execution.cash_buffer < 1:
             raise ValueError("cash_buffer 必须在 [0, 1) 内")
+        if self.execution.rebalance_retry_days < 1:
+            raise ValueError("rebalance_retry_days 必须至少为 1")
         if self.execution.sizing_price != "signal_close":
             raise ValueError("日线引擎目前仅支持 sizing_price=signal_close")
         if not self.execution.fee_schedule:
@@ -363,5 +443,6 @@ class AppConfig:
             data=DataConfig(**data_values),
             backtest=BacktestConfig(**backtest_values),
             strategy=self.strategy,
+            portfolio=self.portfolio,
             execution=self.execution,
         )

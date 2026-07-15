@@ -7,8 +7,12 @@ import numpy as np
 import pandas as pd
 
 from .alpha import build_price_alpha_features
-from .config import StrategyConfig
+from .config import PortfolioConfig, StrategyConfig
 from .data import MarketDataBundle
+from .portfolio import (
+    allocate_portfolio,
+    group_capped_allocation as _group_capped_allocation,
+)
 
 
 @dataclass
@@ -20,6 +24,9 @@ class SignalPlan:
     target_exposure: float
     liquidity: dict[str, float]
     reference_prices: dict[str, float]
+    volatility: dict[str, float]
+    portfolio_model: str
+    portfolio_status: str
 
 
 def _winsorized_zscore(series: pd.Series, quantile: float) -> pd.Series:
@@ -35,73 +42,6 @@ def _winsorized_zscore(series: pd.Series, quantile: float) -> pd.Series:
     return ((clipped - clipped.mean()) / deviation).fillna(0.0)
 
 
-def _group_capped_allocation(
-    raw: pd.Series,
-    total: float,
-    stock_cap: float,
-    groups: pd.Series | None = None,
-    group_cap: float = 1.0,
-) -> pd.Series:
-    """Proportionally allocate while respecting stock and optional group caps."""
-    if raw.empty or total <= 0:
-        return pd.Series(0.0, index=raw.index, dtype=float)
-    if stock_cap <= 0 or group_cap <= 0:
-        return pd.Series(0.0, index=raw.index, dtype=float)
-
-    preferences = pd.to_numeric(raw, errors="coerce").fillna(0.0).clip(lower=0.0)
-    if preferences.sum() <= 0:
-        preferences[:] = 1.0
-    if groups is None:
-        group_labels = pd.Series("ALL", index=raw.index, dtype="object")
-        effective_group_cap = 1.0
-    else:
-        group_labels = groups.reindex(raw.index).fillna("UNKNOWN").astype(str)
-        effective_group_cap = float(group_cap)
-
-    target = min(
-        float(total),
-        len(raw) * float(stock_cap),
-        group_labels.nunique() * effective_group_cap,
-    )
-    result = pd.Series(0.0, index=raw.index, dtype=float)
-
-    for _ in range(len(raw) + group_labels.nunique() + 5):
-        remaining_total = target - float(result.sum())
-        if remaining_total <= 1e-12:
-            break
-        stock_room = float(stock_cap) - result
-        group_used = result.groupby(group_labels).sum()
-        group_room = effective_group_cap - group_labels.map(group_used).fillna(0.0)
-        eligible = (stock_room > 1e-12) & (group_room > 1e-12)
-        if not eligible.any():
-            break
-
-        base = preferences.loc[eligible]
-        if base.sum() <= 0:
-            base = pd.Series(1.0, index=base.index)
-        proposal = base / base.sum() * remaining_total
-        alpha = 1.0
-        positive = proposal > 1e-15
-        if positive.any():
-            alpha = min(
-                alpha,
-                float((stock_room.loc[proposal.index][positive] / proposal[positive]).min()),
-            )
-        proposal_groups = proposal.groupby(group_labels.loc[proposal.index]).sum()
-        used_by_group = result.groupby(group_labels).sum()
-        for group, amount in proposal_groups.items():
-            if amount > 1e-15:
-                room = effective_group_cap - float(used_by_group.get(group, 0.0))
-                alpha = min(alpha, room / float(amount))
-        alpha = max(0.0, min(1.0, alpha))
-        if alpha <= 1e-15:
-            break
-        result.loc[proposal.index] += proposal * alpha
-        if alpha >= 1.0 - 1e-12:
-            break
-    return result
-
-
 def _capped_allocation(raw: pd.Series, total: float, cap: float) -> pd.Series:
     """Backward-compatible single-stock capped allocator."""
     return _group_capped_allocation(raw, total, cap)
@@ -110,9 +50,15 @@ def _capped_allocation(raw: pd.Series, total: float, cap: float) -> pd.Series:
 class MultiFactorStrategy:
     """Point-in-time multi-factor strategy with industry and size controls."""
 
-    def __init__(self, bundle: MarketDataBundle, config: StrategyConfig) -> None:
+    def __init__(
+        self,
+        bundle: MarketDataBundle,
+        config: StrategyConfig,
+        portfolio_config: PortfolioConfig | None = None,
+    ) -> None:
         self.bundle = bundle.prepare()
         self.config = config
+        self.portfolio_config = portfolio_config or PortfolioConfig()
         self.features = self._build_features(self.bundle.bars)
         self.membership_dates = pd.DatetimeIndex(
             sorted(self.bundle.membership["date"].drop_duplicates())
@@ -251,10 +197,12 @@ class MultiFactorStrategy:
         self,
         signal_date: pd.Timestamp | str,
         current_holdings: Iterable[str] | None = None,
+        current_weights: dict[str, float] | None = None,
     ) -> SignalPlan:
         signal_date = pd.Timestamp(signal_date).normalize()
         exact = self.features.loc[self.features["date"].eq(signal_date)].copy()
         liquidity = dict(zip(exact["symbol"], exact["avg_amount_20"], strict=False))
+        volatility = dict(zip(exact["symbol"], exact["volatility"], strict=False))
         members = self._members_at(signal_date)
         candidates = exact.loc[exact["symbol"].isin(members)].copy()
         candidates = candidates.loc[
@@ -302,7 +250,18 @@ class MultiFactorStrategy:
                     "regime",
                 ]
             )
-            return SignalPlan(signal_date, {}, empty, regime, 0.0, liquidity, {})
+            return SignalPlan(
+                signal_date=signal_date,
+                weights={},
+                selection=empty,
+                regime=regime,
+                target_exposure=0.0,
+                liquidity=liquidity,
+                reference_prices={},
+                volatility=volatility,
+                portfolio_model=self.portfolio_config.construction_model,
+                portfolio_status="empty_universe",
+            )
 
         factor_inputs = {
             "mom_12_1": candidates["mom_12_1"],
@@ -335,6 +294,7 @@ class MultiFactorStrategy:
         )
         candidates["rank"] = np.arange(1, len(candidates) + 1)
         selected = self._select_with_buffer(candidates, current_holdings or set())
+        selected = selected.set_index("symbol", drop=False)
         industry_capacity = (
             selected["industry_code"].nunique() * self.config.max_industry_weight
         )
@@ -346,13 +306,40 @@ class MultiFactorStrategy:
         inverse_risk = (1.0 / selected["volatility"].clip(lower=1e-6)).pow(
             self.config.risk_weight_power
         )
-        selected["target_weight"] = _group_capped_allocation(
-            inverse_risk,
-            feasible_exposure,
-            self.config.max_stock_weight,
-            selected["industry_code"],
-            self.config.max_industry_weight,
+        trailing_returns = self._trailing_returns(
+            signal_date,
+            selected["symbol"],
+            self.portfolio_config.covariance_lookback_days,
         )
+        allocation = allocate_portfolio(
+            model=self.portfolio_config.construction_model,
+            inverse_risk=inverse_risk,
+            total=feasible_exposure,
+            stock_cap=self.config.max_stock_weight,
+            groups=selected["industry_code"],
+            group_cap=self.config.max_industry_weight,
+            returns=trailing_returns,
+            current_weights=current_weights,
+            covariance_lookback_days=self.portfolio_config.covariance_lookback_days,
+            minimum_covariance_observations=(
+                self.portfolio_config.minimum_covariance_observations
+            ),
+            covariance_shrinkage=self.portfolio_config.covariance_shrinkage,
+            minimum_variance_blend=self.portfolio_config.minimum_variance_blend,
+            turnover_smoothing=self.portfolio_config.turnover_smoothing,
+            covariance_ridge=self.portfolio_config.covariance_ridge,
+        )
+        selected["raw_target_weight"] = allocation.raw_weights
+        selected["target_weight"] = allocation.weights
+        selected["current_weight"] = selected["symbol"].map(
+            current_weights or {}
+        ).fillna(0.0)
+        selected["target_weight_change"] = (
+            selected["target_weight"] - selected["current_weight"]
+        )
+        selected["portfolio_model"] = self.portfolio_config.construction_model
+        selected["portfolio_status"] = allocation.status
+        selected["covariance_observations"] = allocation.covariance_observations
         selected["signal_date"] = signal_date
         selected["signal_close"] = selected["close"]
         selected["regime"] = regime
@@ -371,6 +358,12 @@ class MultiFactorStrategy:
             "was_held",
             "score_pre_neutral",
             "score",
+            "portfolio_model",
+            "portfolio_status",
+            "covariance_observations",
+            "raw_target_weight",
+            "current_weight",
+            "target_weight_change",
             "target_weight",
             "regime",
             "target_exposure",
@@ -406,6 +399,30 @@ class MultiFactorStrategy:
             reference_prices=dict(
                 zip(selected["symbol"], selected["signal_close"], strict=False)
             ),
+            volatility=volatility,
+            portfolio_model=self.portfolio_config.construction_model,
+            portfolio_status=allocation.status,
+        )
+
+    def _trailing_returns(
+        self,
+        signal_date: pd.Timestamp,
+        symbols: Iterable[str],
+        lookback_days: int,
+    ) -> pd.DataFrame:
+        requested = list(map(str, symbols))
+        rows = self.features.loc[
+            self.features["date"].le(signal_date)
+            & self.features["symbol"].isin(requested),
+            ["date", "symbol", "return_1d"],
+        ]
+        if rows.empty:
+            return pd.DataFrame(columns=requested, dtype=float)
+        return (
+            rows.pivot(index="date", columns="symbol", values="return_1d")
+            .reindex(columns=requested)
+            .sort_index()
+            .tail(lookback_days)
         )
 
     def trailing_amount(self, symbol: str, on_or_before: pd.Timestamp) -> float:
@@ -417,3 +434,13 @@ class MultiFactorStrategy:
         if rows.empty:
             return np.nan
         return float(rows.sort_values("date").iloc[-1]["avg_amount_20"])
+
+    def trailing_volatility(self, symbol: str, on_or_before: pd.Timestamp) -> float:
+        rows = self.features.loc[
+            self.features["symbol"].eq(symbol)
+            & self.features["date"].le(on_or_before),
+            ["date", "volatility"],
+        ]
+        if rows.empty:
+            return np.nan
+        return float(rows.sort_values("date").iloc[-1]["volatility"])

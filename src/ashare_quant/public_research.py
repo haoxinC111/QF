@@ -25,7 +25,21 @@ from .alpha import (
     alpha_profile_governance,
     build_price_alpha_features,
 )
-from .factors import _group_capped_allocation, _winsorized_zscore
+from .execution import (
+    DEFAULT_EXECUTION_MODEL,
+    EXECUTION_MODEL_V1_6,
+    SUPPORTED_EXECUTION_MODELS,
+    execution_model_governance,
+    market_impact_bps,
+)
+from .factors import _winsorized_zscore
+from .portfolio import (
+    DEFAULT_PORTFOLIO_MODEL,
+    PORTFOLIO_MODEL_V1_6,
+    SUPPORTED_PORTFOLIO_MODELS,
+    allocate_portfolio,
+    portfolio_model_governance,
+)
 from .provenance import (
     build_file_inventory,
     build_reproducibility_manifest,
@@ -125,8 +139,20 @@ class PublicStrategyConfig:
     weight_low_downside_volatility: float = 0.0
     weight_drawdown_quality: float = 0.0
     weight_liquidity: float = 0.10
+    portfolio_model: str = DEFAULT_PORTFOLIO_MODEL
+    covariance_lookback_days: int = 120
+    minimum_covariance_observations: int = 60
+    covariance_shrinkage: float = 0.50
+    minimum_variance_blend: float = 0.50
+    turnover_smoothing: float = 0.50
+    covariance_ridge: float = 1e-6
     commission_rate: float = 0.00025
     slippage_bps: float = 5.0
+    market_impact_model: str = DEFAULT_EXECUTION_MODEL
+    market_impact_coefficient: float = 0.50
+    market_impact_volatility_floor: float = 0.10
+    max_market_impact_bps: float = 50.0
+    initial_capital: float = 1_000_000.0
     annual_cash_rate: float = 0.015
     minimum_month_end_quote_coverage: float = 0.95
     regime_symbol: str = PUBLIC_REGIME_SYMBOL
@@ -148,6 +174,36 @@ class PublicStrategyConfig:
             raise ValueError("至少需要一个正的因子权重")
         if self.volatility_lookback < 20:
             raise ValueError("volatility_lookback 至少为 20")
+        if self.portfolio_model not in SUPPORTED_PORTFOLIO_MODELS:
+            raise ValueError("公开组合模型不受支持: " + self.portfolio_model)
+        if self.market_impact_model not in SUPPORTED_EXECUTION_MODELS:
+            raise ValueError("公开成交模型不受支持: " + self.market_impact_model)
+        if not (
+            20
+            <= self.minimum_covariance_observations
+            <= self.covariance_lookback_days
+        ):
+            raise ValueError("公开协方差最低观测数必须在 20 与回看天数之间")
+        for name, value in {
+            "covariance_shrinkage": self.covariance_shrinkage,
+            "minimum_variance_blend": self.minimum_variance_blend,
+            "turnover_smoothing": self.turnover_smoothing,
+        }.items():
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} 必须在 [0, 1] 内")
+        if not np.isfinite(self.covariance_ridge) or self.covariance_ridge <= 0:
+            raise ValueError("covariance_ridge 必须是正有限数")
+        execution_values = [
+            self.commission_rate,
+            self.slippage_bps,
+            self.market_impact_coefficient,
+            self.market_impact_volatility_floor,
+            self.max_market_impact_bps,
+        ]
+        if any(not np.isfinite(value) or value < 0 for value in execution_values):
+            raise ValueError("公开费用和冲击参数必须是非负有限数")
+        if not np.isfinite(self.initial_capital) or self.initial_capital <= 0:
+            raise ValueError("initial_capital 必须是正有限数")
         if not 0 < self.minimum_month_end_quote_coverage <= 1:
             raise ValueError("minimum_month_end_quote_coverage 必须在 (0, 1] 内")
         if not self.regime_symbol or not self.performance_benchmark_symbol:
@@ -194,6 +250,7 @@ class _PublicRebalance:
     buys: float
     sells: float
     cost: float
+    market_impact_cost: float
     locked_value: float
     executable_scale: float
 
@@ -1030,6 +1087,8 @@ def _rebalance_public_positions(
     nav_open: float,
     when: pd.Timestamp,
     config: PublicStrategyConfig,
+    signal_liquidity: dict[str, float] | None = None,
+    signal_volatility: dict[str, float] | None = None,
 ) -> _PublicRebalance:
     """Apply a weight-level rebalance without resizing suspended holdings.
 
@@ -1055,6 +1114,8 @@ def _rebalance_public_positions(
         if symbol in tradable_symbols and weight > 0
     }
     buy_rate, sell_rate = _fee_rates(when, config)
+    liquidity = signal_liquidity or {}
+    volatility = signal_volatility or {}
 
     def evaluate(scale: float) -> _PublicRebalance:
         executable_targets = {
@@ -1064,15 +1125,36 @@ def _rebalance_public_positions(
         }
         positions = {**executable_targets, **locked}
         all_symbols = set(current_positions) | set(positions)
-        buys = sum(
-            max(0.0, positions.get(symbol, 0.0) - current_positions.get(symbol, 0.0))
+        changes = {
+            symbol: positions.get(symbol, 0.0)
+            - current_positions.get(symbol, 0.0)
             for symbol in all_symbols
-        )
-        sells = sum(
-            max(0.0, current_positions.get(symbol, 0.0) - positions.get(symbol, 0.0))
-            for symbol in all_symbols
-        )
-        cost = buys * buy_rate + sells * sell_rate
+        }
+        buys = sum(max(0.0, change) for change in changes.values())
+        sells = sum(max(0.0, -change) for change in changes.values())
+        market_impact_cost = 0.0
+        for symbol, change in changes.items():
+            traded_value = abs(float(change))
+            if traded_value <= 1e-15:
+                continue
+            average_amount = float(liquidity.get(symbol, np.nan))
+            participation = (
+                traded_value * config.initial_capital / average_amount
+                if np.isfinite(average_amount) and average_amount > 0
+                else 0.0
+            )
+            impact = market_impact_bps(
+                model=config.market_impact_model,
+                annualized_volatility=float(volatility.get(symbol, np.nan)),
+                participation_rate=participation,
+                coefficient=config.market_impact_coefficient,
+                annualized_volatility_floor=(
+                    config.market_impact_volatility_floor
+                ),
+                maximum_bps=config.max_market_impact_bps,
+            )
+            market_impact_cost += traded_value * impact / 10_000.0
+        cost = buys * buy_rate + sells * sell_rate + market_impact_cost
         cash = nav_open - sum(positions.values()) - cost
         return _PublicRebalance(
             positions=positions,
@@ -1080,6 +1162,7 @@ def _rebalance_public_positions(
             buys=float(buys),
             sells=float(sells),
             cost=float(cost),
+            market_impact_cost=float(market_impact_cost),
             locked_value=float(sum(locked.values())),
             executable_scale=float(scale),
         )
@@ -1153,6 +1236,8 @@ def _select_targets(
     held_symbols: set[str],
     config: PublicStrategyConfig,
     benchmark_row: pd.Series,
+    trailing_returns: pd.DataFrame | None = None,
+    current_weights: dict[str, float] | None = None,
 ) -> tuple[dict[str, float], pd.DataFrame, str]:
     active_frame = members_at(membership, when)
     active = set(active_frame["symbol"].astype(str))
@@ -1214,13 +1299,38 @@ def _select_targets(
     risk_on = bool(pd.notna(benchmark_row.get("ma")) and benchmark_row["close"] >= benchmark_row["ma"])
     regime = "RISK_ON" if risk_on else "RISK_OFF"
     exposure = config.risk_on_exposure if risk_on else config.risk_off_exposure
-    inverse_vol = 1.0 / selected.set_index("symbol")["volatility"].clip(lower=1e-8)
-    target = _group_capped_allocation(
-        inverse_vol,
+    selected = selected.set_index("symbol", drop=False)
+    inverse_vol = 1.0 / selected["volatility"].clip(lower=1e-8)
+    allocation = allocate_portfolio(
+        model=config.portfolio_model,
+        inverse_risk=inverse_vol,
         total=exposure,
         stock_cap=config.max_stock_weight,
+        groups=pd.Series("ALL", index=selected.index, dtype="object"),
+        group_cap=1.0,
+        returns=trailing_returns,
+        current_weights=current_weights,
+        covariance_lookback_days=config.covariance_lookback_days,
+        minimum_covariance_observations=(
+            config.minimum_covariance_observations
+        ),
+        covariance_shrinkage=config.covariance_shrinkage,
+        minimum_variance_blend=config.minimum_variance_blend,
+        turnover_smoothing=config.turnover_smoothing,
+        covariance_ridge=config.covariance_ridge,
     )
+    target = allocation.weights
+    selected["raw_target_weight"] = allocation.raw_weights
     selected["target_weight"] = selected["symbol"].map(target).fillna(0.0)
+    selected["current_weight"] = selected["symbol"].map(
+        current_weights or {}
+    ).fillna(0.0)
+    selected["target_weight_change"] = (
+        selected["target_weight"] - selected["current_weight"]
+    )
+    selected["portfolio_model"] = config.portfolio_model
+    selected["portfolio_status"] = allocation.status
+    selected["covariance_observations"] = allocation.covariance_observations
     selected.insert(0, "signal_date", when)
     selected["regime"] = regime
     selected["target_exposure"] = exposure
@@ -1323,7 +1433,14 @@ def _audit_public_data_quality(
         "known_limitations": [
             "历史成分来自第三方对中证官方公告的规范化整理，并非中证公司原始机器接口",
             "公开接口没有可靠的历史 ST、历史行业和历史市值快照，因此本测试关闭对应过滤/中性化",
-            "权重级回测未模拟 100 股整手、最低 5 元佣金和涨跌停排队；执行日停牌时保留旧持仓、新目标留现金且不重试",
+            "权重级回测未模拟 100 股整手、最低 5 元佣金、涨跌停排队和容量部分成交；执行日停牌时保留旧持仓、新目标留现金且不重试",
+            (
+                f"平方根冲击按 {config.initial_capital:,.0f} 元初始资金、"
+                "信号日 ADV20 与波动率估算；"
+                "它是公开数据近似成本，不是历史逐笔成交回放"
+                if config.market_impact_model == EXECUTION_MODEL_V1_6
+                else "固定滑点成本不随订单参与率变化"
+            ),
             "沪深300ETF后复权净值作为可投资基准，含基金费率和跟踪误差",
         ],
     }
@@ -1368,13 +1485,23 @@ def run_public_backtest(
     daily = features.loc[features["date"].between(calendar.min(), calendar.max())]
     rows_by_date = {date: group.set_index("symbol") for date, group in daily.groupby("date", sort=False)}
     exact_by_date = {date: group for date, group in features.groupby("date", sort=False) if date in signal_dates}
+    return_history = (
+        features.pivot(index="date", columns="symbol", values="return_1d")
+        .sort_index()
+    )
     benchmark = benchmark_bars.set_index("date").reindex(calendar)
     benchmark["close"] = benchmark["close"].ffill()
     benchmark["benchmark_nav"] = benchmark["close"] / benchmark["close"].iloc[0]
 
     positions: dict[str, float] = {}
     cash = 1.0
-    pending: tuple[pd.Timestamp, dict[str, float], str] | None = None
+    pending: tuple[
+        pd.Timestamp,
+        dict[str, float],
+        str,
+        dict[str, float],
+        dict[str, float],
+    ] | None = None
     curve_rows: list[dict[str, object]] = []
     selection_frames: list[pd.DataFrame] = []
     rebalance_rows: list[dict[str, object]] = []
@@ -1400,7 +1527,13 @@ def run_public_backtest(
 
         cash *= 1.0 + cash_daily
         if pending is not None:
-            signal_date, requested_target, regime = pending
+            (
+                signal_date,
+                requested_target,
+                regime,
+                signal_liquidity,
+                signal_volatility,
+            ) = pending
             nav_open = cash + sum(positions.values())
             tradable_symbols = {
                 str(symbol)
@@ -1419,6 +1552,8 @@ def run_public_backtest(
                 nav_open,
                 date,
                 config,
+                signal_liquidity=signal_liquidity,
+                signal_volatility=signal_volatility,
             )
             positions = outcome.positions
             cash = outcome.cash
@@ -1435,6 +1570,11 @@ def run_public_backtest(
                         else 0.0
                     ),
                     "cost_rate": outcome.cost / nav_open if nav_open else 0.0,
+                    "market_impact_cost_rate": (
+                        outcome.market_impact_cost / nav_open
+                        if nav_open
+                        else 0.0
+                    ),
                     "holding_count": len(positions),
                     "requested_target_exposure": float(sum(requested_target.values())),
                     "actual_target_exposure": (
@@ -1472,6 +1612,11 @@ def run_public_backtest(
         if date in signal_dates:
             exact = exact_by_date.get(date, pd.DataFrame())
             if not exact.empty and date in index_by_date.index:
+                current_weights = {
+                    symbol: value / max(nav_close, 1e-12)
+                    for symbol, value in positions.items()
+                    if value > 1e-12
+                }
                 target, selection, regime = _select_targets(
                     exact,
                     membership,
@@ -1479,9 +1624,31 @@ def run_public_backtest(
                     {symbol for symbol, value in positions.items() if value / max(nav_close, 1e-12) > 1e-5},
                     config,
                     index_by_date.loc[date],
+                    trailing_returns=return_history.loc[
+                        return_history.index <= date
+                    ].tail(config.covariance_lookback_days),
+                    current_weights=current_weights,
                 )
                 if target:
-                    pending = (date, target, regime)
+                    pending = (
+                        date,
+                        target,
+                        regime,
+                        dict(
+                            zip(
+                                exact["symbol"],
+                                exact["avg_amount_20"],
+                                strict=False,
+                            )
+                        ),
+                        dict(
+                            zip(
+                                exact["symbol"],
+                                exact["volatility"],
+                                strict=False,
+                            )
+                        ),
+                    )
                     selection_frames.append(selection)
 
         for symbol in today.index:
@@ -1615,6 +1782,39 @@ def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[P
     ]
 
 
+def public_implementation_variants(
+    base: PublicStrategyConfig | None = None,
+) -> list[PublicStrategyConfig]:
+    """Freeze Alpha while independently toggling v1.6 implementation layers."""
+    base = base or PublicStrategyConfig()
+    return [
+        replace(
+            base,
+            name="baseline_v1_5_1_public",
+            portfolio_model=DEFAULT_PORTFOLIO_MODEL,
+            market_impact_model=DEFAULT_EXECUTION_MODEL,
+        ),
+        replace(
+            base,
+            name="portfolio_only_v1_6_public",
+            portfolio_model=PORTFOLIO_MODEL_V1_6,
+            market_impact_model=DEFAULT_EXECUTION_MODEL,
+        ),
+        replace(
+            base,
+            name="execution_only_v1_6_public",
+            portfolio_model=DEFAULT_PORTFOLIO_MODEL,
+            market_impact_model=EXECUTION_MODEL_V1_6,
+        ),
+        replace(
+            base,
+            name="combined_v1_6_public",
+            portfolio_model=PORTFOLIO_MODEL_V1_6,
+            market_impact_model=EXECUTION_MODEL_V1_6,
+        ),
+    ]
+
+
 def _public_strategy_governance(name: str) -> dict[str, object]:
     if name == ALPHA_MODEL_VERSION:
         return alpha_profile_governance(ALPHA_MODEL_VERSION)
@@ -1647,6 +1847,217 @@ def _annualized_period_turnover(
         start, end
     )
     return float(rebalances.loc[within_period, "one_way_turnover"].sum() / years)
+
+
+def _annualized_period_cost(
+    rebalances: pd.DataFrame,
+    start: str,
+    end: str,
+    column: str,
+) -> float:
+    years = max(
+        (pd.Timestamp(end) - pd.Timestamp(start)).days / 365.2425,
+        1.0,
+    )
+    if rebalances.empty or column not in rebalances.columns:
+        return 0.0
+    within = pd.to_datetime(rebalances["execution_date"]).between(start, end)
+    return float(rebalances.loc[within, column].sum() / years)
+
+
+def write_public_implementation_research(
+    membership_path: str | Path,
+    cache_dir: str | Path,
+    output_dir: str | Path,
+    base_config: PublicStrategyConfig | None = None,
+) -> dict[str, Path]:
+    """Run a weight-level public-data approximation of the v1.6 four arms."""
+    output = Path(output_dir).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    base_config = base_config or PublicStrategyConfig()
+    cache_manifest = verify_public_cache(
+        membership_path,
+        cache_dir,
+        seal_legacy=True,
+    )
+    periods = {
+        "development_2013_2017": ("2013-01-01", "2017-12-31"),
+        "validation_2018_2021": ("2018-01-01", "2021-12-31"),
+        "historical_holdout_seen_2022_2025": ("2022-01-01", "2025-12-31"),
+        "full_requested_period": (
+            base_config.start_date,
+            base_config.end_date,
+        ),
+    }
+    rows: list[dict[str, object]] = []
+    variant_artifacts: list[Path] = []
+    results: dict[str, PublicBacktestResult] = {}
+    variants = public_implementation_variants(base_config)
+    for variant in variants:
+        LOGGER.info("运行公开数据 v1.6 实现归因: %s", variant.name)
+        result = run_public_backtest(
+            membership_path,
+            cache_dir,
+            variant,
+        )
+        results[variant.name] = result
+        variant_dir = output / variant.name
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        files = {
+            "equity_curve.csv": result.equity_curve,
+            "selections.csv": result.selections,
+            "rebalances.csv": result.rebalances,
+        }
+        for filename, frame in files.items():
+            path = variant_dir / filename
+            frame.to_csv(path, index=False)
+            variant_artifacts.append(path)
+        config_path = write_json_atomic(
+            asdict(variant),
+            variant_dir / "config.json",
+        )
+        quality_path = write_json_atomic(
+            result.data_quality,
+            variant_dir / "data_quality.json",
+        )
+        variant_artifacts.extend([config_path, quality_path])
+
+        portfolio_governance = portfolio_model_governance(
+            variant.portfolio_model
+        )
+        execution_governance = execution_model_governance(
+            variant.market_impact_model
+        )
+        for period, (start, end) in periods.items():
+            metrics = _slice_metrics(result.equity_curve, start, end, "nav")
+            rows.append(
+                {
+                    "variant": variant.name,
+                    "portfolio_model": variant.portfolio_model,
+                    "portfolio_status": portfolio_governance[
+                        "lifecycle_status"
+                    ],
+                    "execution_model": variant.market_impact_model,
+                    "execution_status": execution_governance[
+                        "lifecycle_status"
+                    ],
+                    "period": period,
+                    **metrics,
+                    "annual_one_way_turnover": _annualized_period_turnover(
+                        result.rebalances,
+                        start,
+                        end,
+                    ),
+                    "annual_market_impact_cost_rate": _annualized_period_cost(
+                        result.rebalances,
+                        start,
+                        end,
+                        "market_impact_cost_rate",
+                    ),
+                }
+            )
+    metrics = pd.DataFrame(rows)
+    metrics_path = output / "implementation_comparison.csv"
+    metrics.to_csv(metrics_path, index=False)
+
+    report_lines = [
+        "# v1.6 公开数据组合与成交四臂对照",
+        "",
+        "本报告固定同一 Alpha，只切换组合和成交模型。公开通道是权重级近似："
+        "不模拟整手、最低佣金、涨跌停排队、容量部分成交和失败重试。",
+        "平方根冲击按配置中的初始资金、信号日 ADV20 与波动率估算，不能替代严格成交引擎。",
+        "",
+        "| 方案 | 区间 | 组合模型 | 成交模型 | 年化 | 最大回撤 | 夏普 | 年化单边换手 | 年化冲击成本率 |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in metrics.itertuples(index=False):
+        report_lines.append(
+            f"| {row.variant} | {row.period} | {row.portfolio_model} | "
+            f"{row.execution_model} | {row.cagr:.2%} | "
+            f"{row.max_drawdown:.2%} | {row.sharpe:.2f} | "
+            f"{row.annual_one_way_turnover:.2%} | "
+            f"{row.annual_market_impact_cost_rate:.2%} |"
+        )
+    report_lines.extend(
+        [
+            "",
+            "2013–2025 均为已查看历史区间。任何差异都只是绑定当前数据指纹的历史验证，"
+            "不能称为未触碰样本外，也不能证明未来收益。",
+        ]
+    )
+    report_path = output / "PUBLIC_V1.6_IMPLEMENTATION_REPORT.md"
+    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    manifest = {
+        "protocol": "fixed_alpha_four_arm_public_weight_level_approximation",
+        "automatic_parameter_fitting": False,
+        "untouched_holdout_certified": False,
+        "periods": periods,
+        "variants": [asdict(variant) for variant in variants],
+        "portfolio_governance": {
+            model: portfolio_model_governance(model)
+            for model in [DEFAULT_PORTFOLIO_MODEL, PORTFOLIO_MODEL_V1_6]
+        },
+        "execution_governance": {
+            model: execution_model_governance(model)
+            for model in [DEFAULT_EXECUTION_MODEL, EXECUTION_MODEL_V1_6]
+        },
+        "data_fingerprint_sha256": cache_manifest.get(
+            "data_fingerprint_sha256"
+        ),
+        "limitations": next(iter(results.values())).data_quality[
+            "known_limitations"
+        ],
+    }
+    manifest_path = write_json_atomic(
+        manifest,
+        output / "research_manifest.json",
+    )
+    reproducibility = build_reproducibility_manifest(
+        {
+            "base_config": asdict(base_config),
+            "variants": [asdict(variant) for variant in variants],
+            "periods": periods,
+            "protocol": manifest["protocol"],
+        },
+        data_manifest_path=Path(cache_dir) / "manifest.json",
+        extra_input_files=[membership_path],
+    )
+    reproducibility_path = write_json_atomic(
+        reproducibility,
+        output / "reproducibility.json",
+    )
+    artifacts = [
+        metrics_path,
+        report_path,
+        manifest_path,
+        reproducibility_path,
+        *variant_artifacts,
+    ]
+    registry_path = record_experiment(
+        output / "experiment_registry.jsonl",
+        reproducibility,
+        experiment_type="public_v1_6_implementation_comparison",
+        protocol={
+            "evaluation": manifest["protocol"],
+            "automatic_parameter_fitting": False,
+            "untouched_holdout_certified": False,
+            "strict_execution_equivalent": False,
+        },
+        artifacts=artifacts,
+    )
+    artifact_manifest_path = write_artifact_manifest(
+        output,
+        [*artifacts, registry_path],
+    )
+    return {
+        "metrics": metrics_path,
+        "report": report_path,
+        "manifest": manifest_path,
+        "reproducibility": reproducibility_path,
+        "registry": registry_path,
+        "artifacts": artifact_manifest_path,
+    }
 
 
 def write_public_research(

@@ -9,6 +9,8 @@ from pathlib import Path
 from .backtest import Backtester
 from .config import AppConfig, BacktestConfig
 from .data import MarketDataBundle, TushareDownloader, make_demo_bundle
+from .execution import SUPPORTED_EXECUTION_MODELS
+from .portfolio import SUPPORTED_PORTFOLIO_MODELS
 from .report import console_summary, write_report
 from .research import write_research_suite
 from .provenance import ARTIFACT_MANIFEST_FILENAME, verify_artifact_manifest
@@ -17,6 +19,7 @@ from .public_research import (
     PublicStrategyConfig,
     download_public_history,
     verify_public_cache,
+    write_public_implementation_research,
     write_public_research,
     write_public_robustness,
 )
@@ -39,13 +42,13 @@ def _parser() -> argparse.ArgumentParser:
         child.add_argument("--config", default="config.yaml", help="YAML 配置文件")
 
     research = subparsers.add_parser(
-        "research", help="运行 Alpha 对照、因子消融、成本压力和滚动评估"
+        "research", help="运行 Alpha、组合/成交归因、成本压力和滚动评估"
     )
     research.add_argument("--config", default="config.yaml", help="YAML 配置文件")
     research.add_argument(
         "--modes",
-        default="alpha,ablation,cost,rolling",
-        help="逗号分隔：alpha,ablation,cost,rolling",
+        default="alpha,ablation,cost,rolling,implementation",
+        help="逗号分隔：alpha,ablation,cost,rolling,implementation",
     )
     research.add_argument("--output", help="研究结果目录，默认在回测输出目录下")
     research.add_argument("--slippage-bps", default="5,10,20")
@@ -56,6 +59,16 @@ def _parser() -> argparse.ArgumentParser:
     demo = subparsers.add_parser("demo", help="无需 Token 的离线端到端演示")
     demo.add_argument("--output", default="results/demo", help="演示报告输出目录")
     demo.add_argument("--seed", type=int, default=7)
+    demo.add_argument(
+        "--portfolio-model",
+        choices=sorted(SUPPORTED_PORTFOLIO_MODELS),
+        help="覆盖组合模型；省略时使用生产基线",
+    )
+    demo.add_argument(
+        "--execution-model",
+        choices=sorted(SUPPORTED_EXECUTION_MODELS),
+        help="覆盖成交模型；省略时使用生产基线",
+    )
 
     public_download = subparsers.add_parser(
         "public-download", help="从公开 HTTPS 接口下载历史沪深300成分日线"
@@ -85,6 +98,32 @@ def _parser() -> argparse.ArgumentParser:
     public_robustness.add_argument("--output", default="results/public_research/robustness")
     public_robustness.add_argument("--start", default="2013-01-01")
     public_robustness.add_argument("--end", default="2025-12-31")
+
+    public_implementation = subparsers.add_parser(
+        "public-implementation",
+        help="在公开缓存上运行 v1.6 组合/成交权重级四臂对照",
+    )
+    public_implementation.add_argument(
+        "--membership",
+        required=True,
+        help="csi300.csv 历史成分文件",
+    )
+    public_implementation.add_argument(
+        "--cache",
+        default="data/public_eastmoney",
+    )
+    public_implementation.add_argument(
+        "--output",
+        default="results/public_implementation_v1_6",
+    )
+    public_implementation.add_argument("--start", default="2013-01-01")
+    public_implementation.add_argument("--end", default="2025-12-31")
+    public_implementation.add_argument(
+        "--initial-capital",
+        type=float,
+        default=1_000_000.0,
+        help="平方根冲击参与率换算的初始资金，默认 100 万元",
+    )
 
     public_verify = subparsers.add_parser(
         "public-verify", help="验证公开行情缓存和历史成分文件的 SHA256 指纹"
@@ -153,13 +192,31 @@ def _dispatch(args: argparse.Namespace) -> int:
             data=replace(config.data, provider="synthetic_demo"),
             backtest=BacktestConfig(**backtest_values),
             strategy=config.strategy,
-            execution=config.execution,
+            portfolio=replace(
+                config.portfolio,
+                construction_model=(
+                    args.portfolio_model
+                    or config.portfolio.construction_model
+                ),
+            ),
+            execution=replace(
+                config.execution,
+                market_impact_model=(
+                    args.execution_model
+                    or config.execution.market_impact_model
+                ),
+            ),
         )
         _run_backtest(
             make_demo_bundle(seed=args.seed),
             config,
             experiment_type="synthetic_demo",
-            run_context={"seed": args.seed, "investable_data": False},
+            run_context={
+                "seed": args.seed,
+                "investable_data": False,
+                "portfolio_model_override": args.portfolio_model,
+                "execution_model_override": args.execution_model,
+            },
         )
         return 0
 
@@ -186,7 +243,10 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.membership,
             args.cache,
             args.output,
-            PublicStrategyConfig(start_date=args.start, end_date=args.end),
+            PublicStrategyConfig(
+                start_date=args.start,
+                end_date=args.end,
+            ),
         )
         print("公开数据研究完成:")
         for name, path in written.items():
@@ -201,6 +261,22 @@ def _dispatch(args: argparse.Namespace) -> int:
             PublicStrategyConfig(start_date=args.start, end_date=args.end),
         )
         print("公开数据稳健性检查完成:")
+        for name, path in written.items():
+            print(f"  {name}: {path}")
+        return 0
+
+    if args.command == "public-implementation":
+        written = write_public_implementation_research(
+            args.membership,
+            args.cache,
+            args.output,
+            PublicStrategyConfig(
+                start_date=args.start,
+                end_date=args.end,
+                initial_capital=args.initial_capital,
+            ),
+        )
+        print("公开数据 v1.6 组合/成交四臂对照完成:")
         for name, path in written.items():
             print(f"  {name}: {path}")
         return 0

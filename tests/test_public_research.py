@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import ashare_quant.public_research as public_module
+import ashare_quant.cli as cli_module
 from ashare_quant.alpha import (
     ALPHA_MODEL_VERSION,
     FORMATION_RETURN_DAYS,
@@ -39,13 +41,52 @@ from ashare_quant.public_research import (
     download_public_history,
     load_membership,
     members_at,
+    public_implementation_variants,
     public_strategy_variants,
     seal_public_cache,
     verify_public_cache,
+    write_public_implementation_research,
 )
+from ashare_quant.provenance import verify_artifact_manifest
 
 
 class PublicResearchTests(unittest.TestCase):
+    def test_public_cli_routes_initial_capital_only_to_implementation(self) -> None:
+        research_args = cli_module._parser().parse_args(
+            [
+                "public-research",
+                "--membership",
+                "members.csv",
+            ]
+        )
+        implementation_args = cli_module._parser().parse_args(
+            [
+                "public-implementation",
+                "--membership",
+                "members.csv",
+                "--initial-capital",
+                "2500000",
+            ]
+        )
+
+        with mock.patch.object(
+            cli_module,
+            "write_public_research",
+            return_value={},
+        ) as research_writer:
+            self.assertEqual(cli_module._dispatch(research_args), 0)
+        research_config = research_writer.call_args.args[3]
+        self.assertEqual(research_config.initial_capital, 1_000_000.0)
+
+        with mock.patch.object(
+            cli_module,
+            "write_public_implementation_research",
+            return_value={},
+        ) as implementation_writer:
+            self.assertEqual(cli_module._dispatch(implementation_args), 0)
+        implementation_config = implementation_writer.call_args.args[3]
+        self.assertEqual(implementation_config.initial_capital, 2_500_000.0)
+
     def test_sina_decoder_uses_one_runtime_on_its_owner_thread(self) -> None:
         events: dict[str, object] = {"created": 0, "calls": []}
 
@@ -420,6 +461,30 @@ class PublicResearchTests(unittest.TestCase):
             QUALITY_MOMENTUM_V1_5_WEIGHTS["drawdown_quality"],
         )
 
+    def test_v1_6_public_implementation_has_four_fixed_alpha_arms(self) -> None:
+        variants = public_implementation_variants()
+        self.assertEqual(
+            {variant.name for variant in variants},
+            {
+                "baseline_v1_5_1_public",
+                "portfolio_only_v1_6_public",
+                "execution_only_v1_6_public",
+                "combined_v1_6_public",
+            },
+        )
+        self.assertEqual(
+            len({tuple(variant.factor_weights) for variant in variants}),
+            1,
+        )
+        self.assertEqual(
+            {variant.portfolio_model for variant in variants},
+            {"inverse_vol_v1_4", "shrinkage_min_variance_v1_6"},
+        )
+        self.assertEqual(
+            {variant.market_impact_model for variant in variants},
+            {"fixed_bps", "square_root_v1_6"},
+        )
+
     def test_metrics_cagr_and_drawdown(self) -> None:
         curve = pd.DataFrame(
             {
@@ -519,6 +584,111 @@ class PublicResearchTests(unittest.TestCase):
             1.0,
             places=12,
         )
+
+    def test_public_square_root_impact_adds_auditable_cost(self) -> None:
+        baseline = PublicStrategyConfig()
+        experimental = replace(
+            baseline,
+            market_impact_model="square_root_v1_6",
+        )
+        kwargs = {
+            "current_positions": {"OLD": 0.50},
+            "requested_target": {"NEW": 0.50},
+            "tradable_symbols": {"OLD", "NEW"},
+            "nav_open": 1.0,
+            "when": pd.Timestamp("2024-01-02"),
+            "signal_liquidity": {"OLD": 50_000_000.0, "NEW": 50_000_000.0},
+            "signal_volatility": {"OLD": 0.30, "NEW": 0.30},
+        }
+        fixed = _rebalance_public_positions(config=baseline, **kwargs)
+        impacted = _rebalance_public_positions(config=experimental, **kwargs)
+        self.assertEqual(fixed.market_impact_cost, 0.0)
+        self.assertGreater(impacted.market_impact_cost, 0.0)
+        self.assertGreater(impacted.cost, fixed.cost)
+        self.assertAlmostEqual(
+            impacted.cash + sum(impacted.positions.values()) + impacted.cost,
+            1.0,
+            places=12,
+        )
+
+    def test_public_v1_6_writer_seals_four_arm_results(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            membership_path = root / "csi300.csv"
+            symbols = [f"SH60000{number}" for number in range(6)]
+            pd.DataFrame(
+                [
+                    {
+                        "symbol": symbol,
+                        "name": f"测试{number}",
+                        "opt-in": "2010-01-01",
+                        "opt-out": "",
+                    }
+                    for number, symbol in enumerate(symbols)
+                ]
+            ).to_csv(membership_path, index=False)
+            dates = pd.bdate_range("2016-01-04", "2018-06-29")
+            cache = root / "cache"
+            bar_dir = cache / "bars"
+            bar_dir.mkdir(parents=True)
+
+            def write_bars(symbol: str, number: int) -> None:
+                trend = np.linspace(0.0, 8.0 + number * 0.2, len(dates))
+                cycle = 0.15 * np.sin(np.arange(len(dates)) / (9.0 + number))
+                close = 10.0 + number + trend + cycle
+                frame = pd.DataFrame(
+                    {
+                        "date": dates,
+                        "symbol": symbol,
+                        "name": symbol,
+                        "open": close * (1.0 + 0.0002),
+                        "close": close,
+                        "volume": 2_000_000.0,
+                        "amount": 100_000_000.0 + number * 1_000_000.0,
+                    }
+                )
+                frame.to_csv(
+                    bar_dir / f"{symbol}.csv.gz",
+                    index=False,
+                    compression="gzip",
+                )
+
+            for number, symbol in enumerate(symbols):
+                write_bars(symbol, number)
+            write_bars("SH000300", 7)
+            write_bars("SH510300", 8)
+            seal_public_cache(membership_path, cache)
+            output = root / "output"
+            written = write_public_implementation_research(
+                membership_path,
+                cache,
+                output,
+                PublicStrategyConfig(
+                    start_date="2018-01-02",
+                    end_date="2018-06-29",
+                    top_n=5,
+                    exit_rank=6,
+                    max_stock_weight=0.20,
+                    min_avg_amount=1_000_000.0,
+                ),
+            )
+            verification = verify_artifact_manifest(
+                written["artifacts"],
+                strict=True,
+            )
+            metrics = pd.read_csv(written["metrics"])
+            full = metrics.loc[metrics["period"].eq("full_requested_period")]
+            self.assertTrue(verification["verified"])
+            self.assertEqual(len(full), 4)
+            self.assertEqual(
+                set(full["portfolio_model"]),
+                {"inverse_vol_v1_4", "shrinkage_min_variance_v1_6"},
+            )
+            impacted = full.loc[
+                full["execution_model"].eq("square_root_v1_6"),
+                "annual_market_impact_cost_rate",
+            ]
+            self.assertTrue((impacted > 0).all())
 
     def test_public_cache_fingerprint_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

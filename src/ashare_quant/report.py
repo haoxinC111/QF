@@ -17,6 +17,8 @@ import yaml
 from .alpha import alpha_profile_governance, identify_alpha_profile
 from .backtest import BacktestResult
 from .config import AppConfig
+from .execution import execution_model_governance
+from .portfolio import portfolio_model_governance
 from .provenance import (
     build_reproducibility_manifest,
     record_experiment,
@@ -236,12 +238,67 @@ def calculate_metrics(result: BacktestResult, config: AppConfig) -> dict[str, An
 
     alpha_profile = identify_alpha_profile(config.strategy.factor_weights)
     alpha_governance = alpha_profile_governance(alpha_profile)
+    portfolio_governance = portfolio_model_governance(
+        config.portfolio.construction_model
+    )
+    execution_governance = execution_model_governance(
+        config.execution.market_impact_model
+    )
+    trades = result.trades
+    average_participation = (
+        float(trades["participation_rate"].mean())
+        if not trades.empty and "participation_rate" in trades
+        else np.nan
+    )
+    maximum_participation = (
+        float(trades["participation_rate"].max())
+        if not trades.empty and "participation_rate" in trades
+        else np.nan
+    )
+    estimated_fixed_slippage_cost = (
+        float(trades["estimated_fixed_slippage_cost"].sum())
+        if not trades.empty and "estimated_fixed_slippage_cost" in trades
+        else 0.0
+    )
+    estimated_market_impact_cost = (
+        float(trades["estimated_market_impact_cost"].sum())
+        if not trades.empty and "estimated_market_impact_cost" in trades
+        else 0.0
+    )
+    realized_slippage_cost = (
+        float(trades["realized_slippage_cost"].sum())
+        if not trades.empty and "realized_slippage_cost" in trades
+        else 0.0
+    )
+    partial_fill_count = (
+        int(result.orders["status"].eq("PARTIAL").sum())
+        if not result.orders.empty and "status" in result.orders
+        else 0
+    )
     return {
         "alpha_profile": alpha_profile,
         "alpha_profile_status": alpha_governance["lifecycle_status"],
         "alpha_promotion_decision": alpha_governance["promotion_decision"],
         "alpha_default_eligible": bool(alpha_governance["default_eligible"]),
         "alpha_governance_reason": alpha_governance["reason"],
+        "portfolio_model": config.portfolio.construction_model,
+        "portfolio_model_status": portfolio_governance["lifecycle_status"],
+        "portfolio_promotion_decision": portfolio_governance[
+            "promotion_decision"
+        ],
+        "portfolio_default_eligible": bool(
+            portfolio_governance["default_eligible"]
+        ),
+        "portfolio_governance_reason": portfolio_governance["reason"],
+        "execution_model": config.execution.market_impact_model,
+        "execution_model_status": execution_governance["lifecycle_status"],
+        "execution_promotion_decision": execution_governance[
+            "promotion_decision"
+        ],
+        "execution_default_eligible": bool(
+            execution_governance["default_eligible"]
+        ),
+        "execution_governance_reason": execution_governance["reason"],
         "start_date": str(pd.Timestamp(curve["date"].iloc[0]).date()),
         "end_date": str(pd.Timestamp(curve["date"].iloc[-1]).date()),
         "trading_days": int(len(curve)),
@@ -279,6 +336,12 @@ def calculate_metrics(result: BacktestResult, config: AppConfig) -> dict[str, An
         "buffered_selection_ratio": _finite(buffered_selection_ratio),
         "average_size_exposure_z": _finite(average_size_exposure),
         "total_fees": float(curve["cumulative_fees"].iloc[-1]),
+        "estimated_fixed_slippage_cost": estimated_fixed_slippage_cost,
+        "estimated_market_impact_cost": estimated_market_impact_cost,
+        "realized_slippage_cost": realized_slippage_cost,
+        "average_fill_participation": _finite(average_participation),
+        "maximum_fill_participation": _finite(maximum_participation),
+        "partial_fill_count": partial_fill_count,
         "total_dividends_paid": float(curve["cumulative_dividends"].iloc[-1]),
         "total_cash_interest": float(curve["cumulative_cash_interest"].iloc[-1]),
         "total_delist_writeoff": float(curve["cumulative_delist_writeoff"].iloc[-1]),
@@ -314,6 +377,8 @@ def _format_metric(name: str, value: Any) -> str:
         "annual_turnover",
         "maximum_target_industry_weight",
         "buffered_selection_ratio",
+        "average_fill_participation",
+        "maximum_fill_participation",
     }
     if value is None:
         return "N/A"
@@ -326,6 +391,9 @@ def _format_metric(name: str, value: Any) -> str:
         "total_dividends_paid",
         "total_cash_interest",
         "total_delist_writeoff",
+        "estimated_fixed_slippage_cost",
+        "estimated_market_impact_cost",
+        "realized_slippage_cost",
     }:
         return f"{float(value):,.2f}"
     if isinstance(value, float):
@@ -392,6 +460,10 @@ def _html_report(
         "alpha_profile": "Alpha 配置",
         "alpha_profile_status": "Alpha 状态",
         "alpha_promotion_decision": "默认晋级决定",
+        "portfolio_model": "组合模型",
+        "portfolio_model_status": "组合模型状态",
+        "execution_model": "成交模型",
+        "execution_model_status": "成交模型状态",
         "total_return": "累计收益",
         "cagr": "年化收益",
         "annual_volatility": "年化波动",
@@ -408,6 +480,11 @@ def _html_report(
         "buffered_selection_ratio": "缓冲保留入选占比",
         "average_size_exposure_z": "平均市值风格 Z",
         "total_fees": "累计费用",
+        "estimated_fixed_slippage_cost": "估算固定滑点成本",
+        "estimated_market_impact_cost": "估算市场冲击成本",
+        "average_fill_participation": "平均成交参与率",
+        "maximum_fill_participation": "最大成交参与率",
+        "partial_fill_count": "部分成交订单数",
         "total_dividends_paid": "累计到账分红",
         "total_delist_writeoff": "累计退市核销",
         "filled_trade_count": "成交笔数",
@@ -429,6 +506,18 @@ def _html_report(
             f"当前 Alpha 为 {metrics['alpha_profile_status']}，"
             f"默认晋级决定为 {metrics['alpha_promotion_decision']}："
             f"{metrics['alpha_governance_reason']}。",
+        )
+    if metrics["portfolio_model_status"] != "promoted":
+        warnings.insert(
+            1,
+            f"当前组合模型为 {metrics['portfolio_model_status']}："
+            f"{metrics['portfolio_governance_reason']}。",
+        )
+    if metrics["execution_model_status"] != "promoted":
+        warnings.insert(
+            1,
+            f"当前成交模型为 {metrics['execution_model_status']}："
+            f"{metrics['execution_governance_reason']}。",
         )
     warning_html = "".join(f"<li>{item}</li>" for item in warnings)
     config_text = yaml.safe_dump(config.to_dict(), allow_unicode=True, sort_keys=False)
@@ -546,6 +635,10 @@ def console_summary(metrics: dict[str, Any]) -> str:
         ("alpha_profile", "Alpha 配置"),
         ("alpha_profile_status", "Alpha 状态"),
         ("alpha_promotion_decision", "默认晋级决定"),
+        ("portfolio_model", "组合模型"),
+        ("portfolio_model_status", "组合状态"),
+        ("execution_model", "成交模型"),
+        ("execution_model_status", "成交状态"),
         ("final_nav", "期末净值"),
         ("cagr", "年化收益"),
         ("max_drawdown", "最大回撤"),
@@ -554,5 +647,6 @@ def console_summary(metrics: dict[str, Any]) -> str:
         ("excess_cagr", "风险匹配年化超额"),
         ("annual_turnover", "年化单边换手"),
         ("total_fees", "累计费用"),
+        ("estimated_market_impact_cost", "估算冲击成本"),
     ]
     return "\n".join(f"{label}: {_format_metric(key, metrics.get(key))}" for key, label in keys)

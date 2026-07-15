@@ -62,6 +62,18 @@ strategy:
   size_neutralization_enabled: true
   size_neutralization_strength: 1.0
 
+portfolio:
+  # 生产基线保持 inverse_vol_v1_4。复核 v1.6 时显式改为
+  # shrinkage_min_variance_v1_6；报告会标记 experimental/pending_validation。
+  construction_model: inverse_vol_v1_4
+  covariance_lookback_days: 120
+  minimum_covariance_observations: 60
+  covariance_shrinkage: 0.50
+  minimum_variance_blend: 0.50
+  # 0 表示完全跟随新风险目标，0.5 表示把当前持仓作为一半偏好后重施硬上限。
+  turnover_smoothing: 0.50
+  covariance_ridge: 0.000001
+
 execution:
   lot_size: 100
   commission_rate: 0.00025
@@ -80,6 +92,11 @@ execution:
       stamp_duty_sell: 0.0005
       transfer_fee_rate: 0.00001
   slippage_bps: 5
+  # 生产基线保持 fixed_bps；v1.6 研究臂使用 square_root_v1_6。
+  market_impact_model: fixed_bps
+  market_impact_coefficient: 0.50
+  market_impact_volatility_floor: 0.10
+  max_market_impact_bps: 50
   cash_buffer: 0.02
   max_participation_of_20d_amount: 0.05
   rebalance_retry_days: 3

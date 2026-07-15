@@ -1,6 +1,6 @@
 # A股动态股票池多因子量化回测
 
-这是一个研究/回测级的 Python 项目。v1.5 在 v1.4 的可信度与下载稳定性基础上新增“质量动量”候选；v1.5.1 根据真实公开历史回放撤销了该候选的默认晋级，生产默认恢复为 `legacy_v1_4`，候选则保持冻结并显式标记为实验状态。严格通道仍显式建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、滑点和成交容量。
+这是一个研究/回测级的 Python 项目。v1.5.1 根据真实公开历史回放把生产 Alpha 默认恢复为 `legacy_v1_4`；v1.6 在保持该 Alpha 与入选证券不变的前提下，新增可审计的收缩协方差组合模型和平方根市场冲击模型。两项 v1.6 能力目前均为显式启用的实验模型，生产默认不变。严格通道继续建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、部分成交、滑点和成交容量。
 
 > 重要：本项目不构成投资建议，不承诺收益，也没有连接券商下单。先用离线演示确认环境，再用自己的数据权限回测；任何真实资金使用前，都应做样本外检验、压力测试、人工复核和小资金仿真。
 
@@ -14,7 +14,7 @@
 2. 剔除 ST、历史不足、成交额不足、价格过低以及长期趋势为负的股票。
 3. 计算五个正权重价格因子，做截面缩尾和标准化；综合分数对当日有效申万行业和对数总市值做截面残差化。
 4. 新股票按前 20 名进入；已实际持有的股票只要仍在前 35 名即可保留，减少排名边界附近的无效往返交易。
-5. 用逆波动率分配权重，单股不超过 8%，单个行业目标权重不超过 25%。约束不可同时满足时保守降低股票总敞口。
+5. 生产基线用逆波动率分配权重；v1.6 实验模型可在同一入选集合上混合收缩协方差最小方差偏好和当前持仓。两者都保证单股不超过 8%、单行业不超过 25%，不可行时保守降低股票总敞口。
 6. 用沪深 300 **价格指数**的 200 日均线决定总股票仓位：风险开启 95%，风险关闭 30%；业绩比较单独使用沪深 300 **全收益指数**。
 7. 信号日收盘冻结订单股数，下一交易日只按实际开盘价决定成交金额；遇到停牌、涨跌停或容量限制，最多重试 3 个交易日。
 
@@ -42,7 +42,7 @@ Score_i={}&0.35Z(MOM12\_1)+0.20Z(MOM6\_1)+0.15Z(Trend)\\
 \end{aligned}
 \]
 
-v1.5 实验候选的公式、冻结权重和原始协议详见 [`V1.5_ALPHA.md`](V1.5_ALPHA.md)，工程验收见 [`V1.5_VALIDATION.md`](V1.5_VALIDATION.md)，默认回退与数据完整性修复见 [`V1.5.1_GOVERNANCE.md`](V1.5.1_GOVERNANCE.md)。2013–2025 已被旧版本研究查看，v1.5 历史回放不属于未触碰样本外；项目也不会为了达到指定年化收益而自动调参。
+v1.5 实验候选的公式、冻结权重和原始协议详见 [`V1.5_ALPHA.md`](V1.5_ALPHA.md)，默认回退与数据完整性修复见 [`V1.5.1_GOVERNANCE.md`](V1.5.1_GOVERNANCE.md)。v1.6 的组合公式、冲击公式、四臂归因和晋级边界见 [`V1.6_PORTFOLIO_EXECUTION.md`](V1.6_PORTFOLIO_EXECUTION.md)。2013–2025 已被旧版本研究查看，不属于未触碰样本外；项目不会为了达到指定年化收益而自动调参。
 
 原始综合分数形成后，程序以当日有效的行业哑变量和 `log(total_mv)` 做横截面最小二乘残差化；`size_neutralization_strength=1` 表示完整剔除线性市值暴露。这里的“中性”只针对选股分数，不意味着实际组合对所有风险因子严格零暴露，实际结果应查看 `style_exposure.csv`。
 
@@ -71,12 +71,12 @@ v1.5 实验候选的公式、冻结权重和原始协议详见 [`V1.5_ALPHA.md`]
 | 零股卖出 | 清仓时允许一次性卖出剩余零股 |
 | 停牌 | 当日没有行情或成交量为 0 时拒单 |
 | 涨跌停 | 开盘触及涨停不买，开盘触及跌停不卖；优先使用数据源的每日涨跌停价 |
-| 滑点 | 默认买入加 5 bps、卖出减 5 bps，并限制在涨跌停价格内 |
+| 滑点与冲击 | 默认固定 5 bps；v1.6 可显式启用波动率 × 参与率平方根冲击，并限制在涨跌停价格内 |
 | 成交容量 | 单日订单不超过已知 20 日平均成交额的 5% |
 | 费用 | 按成交日期查询费用表；覆盖 2022 年过户费和 2023 年印花税调整 |
 | ST/退市 | 执行日重新检查 ST；退市后按明确策略结算或核销，禁止永久保留旧市值 |
 | 陈旧价格 | 超过指定交易日没有行情时警告或终止回测，不再静默处理 |
-| 失败重试 | 固定信号日目标股数，最多尝试 3 个交易日，之后取消 |
+| 部分成交与重试 | 固定信号日目标股数；容量不足按整手部分成交，剩余订单最多尝试 3 个交易日，之后取消 |
 
 手续费均可在配置中修改。券商实际佣金、最低收费和监管费率可能不同，运行真实资金前必须按自己的账户确认。
 
@@ -105,6 +105,14 @@ pip install -r requirements.txt
 
 ```bash
 python run.py demo --output results/demo
+```
+
+只验证 v1.6 组合与成交链路（仍是假行情，不是收益证据）：
+
+```bash
+python run.py demo --output results/demo_v1_6 \
+  --portfolio-model shrinkage_min_variance_v1_6 \
+  --execution-model square_root_v1_6
 ```
 
 完成后打开：
@@ -175,6 +183,21 @@ python run.py public-robustness \
   --output results/public_research/robustness
 ```
 
+用同一份公开缓存运行 v1.6 固定 Alpha 的四臂归因：
+
+```bash
+python run.py public-implementation \
+  --membership ../public_data/index-constitution/history/csi300.csv \
+  --cache ../public_data/sina_csi300 \
+  --output results/public_implementation_v1_6 \
+  --initial-capital 1000000
+
+python run.py result-verify \
+  --output results/public_implementation_v1_6 --strict
+```
+
+该命令会对比旧基线、仅新组合、仅新成交和组合+成交。它能直接复用 2012–2025 公开缓存，但仍是权重级近似：平方根冲击按 100 万元初始资金、信号日 ADV20 和波动率估算；不模拟整手、最低佣金、涨跌停排队、容量部分成交与失败重试。严格成交结论必须回到 Tushare 通道。
+
 核心结果在 `results/public_research/period_metrics.csv`，每组策略还会生成净值、月度选择、调仓和数据质量文件。公开通道是为了在无商业数据权限时验证收益方向，不冒充交易所级仿真：它没有可靠的历史 ST、历史行业和历史市值快照，采用权重级成本模型，也不模拟整手、最低佣金、涨跌停排队和停牌延迟。因此，公开结果应作为筛选依据，最终候选仍要回到下面的严格 Tushare 通道复核。
 
 v1.5.1 起，`data_quality.json` 不再只输出文件数和总体覆盖率，还会列出完全无行情的历史成员、每个信号月的成分数/报价数/缺失证券、低于 95% 告警阈值的月份，以及执行日缺失行情的去重证券。告警不会自动证明数据错误，也不会被静默忽略：应结合停牌和成分区间逐项核查。
@@ -195,6 +218,17 @@ strategy:
 ```
 
 若只想复核冻结的 v1.5 实验候选，可改为 `quality_momentum_v1_5`。报告会继续标记其 `experimental/rejected` 状态；这不会把它晋级为生产默认。自定义八项权重时必须使用 `alpha_profile: custom`，命名配置和冲突权重会直接报错。
+
+v1.6 升级后组合与成交默认仍是旧生产基线。要运行新模型，必须显式配置：
+
+```yaml
+portfolio:
+  construction_model: shrinkage_min_variance_v1_6
+execution:
+  market_impact_model: square_root_v1_6
+```
+
+报告会将两者标记为 `experimental/pending_validation`。这表示可以研究，不表示已获准替换生产默认。
 
 注册 Tushare Pro，确认自己的积分/接口权限后，把 Token 放入环境变量。不要把 Token 写进 YAML 或提交到 Git：
 
@@ -226,7 +260,7 @@ python run.py backtest --config config.yaml
 python run.py research --config config.yaml
 ```
 
-默认会生成 v1.4/v1.5 冻结 Alpha 同口径对照、“完整模型 + 当前正权重因子逐一剔除”、5/10/20 bps 滑点与 1/2 倍券商佣金组合、以及 5 年研究期后逐年向前滚动的固定参数样本外结果。法定印花税和过户费不会随佣金倍数放大。
+默认会生成 v1.4/v1.5 冻结 Alpha 同口径对照、“完整模型 + 当前正权重因子逐一剔除”、5/10/20 bps 滑点与 1/2 倍券商佣金组合、5 年研究期后逐年向前滚动的固定参数评估，以及固定 Alpha 的 v1.6 组合/成交四臂归因。法定印花税和过户费不会随佣金倍数放大。
 
 也可以分开执行：
 
@@ -246,13 +280,13 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 | --- | --- |
 | `report.html` | 自包含图表、指标、月度收益、配置和风险说明 |
 | `performance.png` | 净值与回撤图 |
-| `metrics.json` | Alpha 配置身份、生命周期/晋级决定、策略、全收益基准、风险匹配基准、换手、费用和公司行动指标 |
+| `metrics.json` | Alpha/组合/成交模型身份与晋级状态、策略、基准、换手、参与率、滑点/冲击成本和公司行动指标 |
 | `equity_curve.csv` | 每日策略净值、现金、分红应收、持仓、陈旧持仓数及两条基准净值 |
-| `selections.csv` | 每次调仓的因子值、排名和目标权重 |
+| `selections.csv` | 每次调仓的因子值、排名、风险原始目标、当前权重、最终目标、组合模型状态和协方差观测数 |
 | `industry_exposure.csv` | 每次调仓的行业持股数、绝对目标权重和股票仓位内占比 |
 | `style_exposure.csv` | 市值、动量、趋势、低波和流动性暴露及缓冲保留比例 |
-| `orders.csv` | 所有成交、拒单和撤单及原因 |
-| `trades.csv` | 实际成交明细和费用拆分 |
+| `orders.csv` | 所有成交、部分成交、拒单和撤单；含请求/剩余股数、容量、参与率、滑点与冲击审计 |
+| `trades.csv` | 实际成交、参考价、模型/实现滑点、冲击成本和费用拆分 |
 | `corporate_events.csv` | 现金分红、送股、到账和退市核销事件 |
 | `final_positions.json` | 期末持仓市值 |
 | `resolved_config.yaml` | 本次运行的完整配置快照 |
@@ -269,6 +303,7 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 | `factor_ablation.csv` | 完整模型和逐个剔除当前正权重因子的同口径指标 |
 | `cost_stress.csv` | 不同滑点/券商佣金组合的收益、回撤、换手和费用 |
 | `rolling_oos.csv` | 扩展研究窗、非重叠测试窗的固定参数样本外指标 |
+| `implementation_comparison.csv` | 固定 Alpha 的旧基线、仅新组合、仅新成交、组合+成交四臂归因 |
 | `research_manifest.json` | 本次研究模式、压力参数和窗口参数 |
 | `reproducibility.json` | 研究配置、代码和数据的完整可复现身份 |
 | `experiment_registry.jsonl` | 固定参数研究协议和实验身份登记 |
@@ -289,6 +324,8 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 | `<strategy>/data_quality.json` | 无行情成员、逐月成分行情覆盖、阈值告警、缺失成交和已知限制 |
 | `robustness/cost_stress.csv` | v1.5 候选在 5/10/20 bps 单边滑点下的全区间与已查看历史保留期结果 |
 | `robustness/factor_ablation.csv` | 逐一删除 v1.5 六个正权重因子的同口径结果 |
+
+`public-implementation` 另在 `results/public_implementation_v1_6/` 生成 `implementation_comparison.csv`、四个方案的净值/选择/调仓明细、公开口径说明、复现指纹和产物 SHA256。
 
 每次生成结果后可校验所有已封存文件：
 
@@ -329,7 +366,13 @@ python run.py result-verify --output results/public_research/robustness --strict
 - `risk_on_exposure` / `risk_off_exposure`：风险开启和关闭时总股票仓位。
 - `max_stock_weight`：单股绝对权重上限。必须满足 `top_n × max_stock_weight >= risk_on_exposure`。
 - `max_industry_weight`：单个行业占总资产的目标权重硬上限；行业不足时允许组合低配现金。
+- `portfolio.construction_model`：`inverse_vol_v1_4` 是生产默认；`shrinkage_min_variance_v1_6` 是实验模型，不改变入选股票，只改变目标权重。
+- `covariance_lookback_days` / `minimum_covariance_observations`：v1.6 协方差回看和最低有效观测；不足时显式回退旧模型并写入状态。
+- `covariance_shrinkage` / `minimum_variance_blend`：样本协方差向对角阵收缩比例，以及最小方差偏好与逆波动率偏好的混合比例。
+- `turnover_smoothing`：把信号日实际持仓纳入目标偏好的强度；不会阻止不再入选证券退出，也不会突破单股/行业硬上限。
 - `slippage_bps`：单边滑点。建议同时压力测试 5、10、20 bps。
+- `market_impact_model`：`fixed_bps` 是生产默认；`square_root_v1_6` 按信号时点年化波动率和订单/滞后 ADV20 参与率增加冲击。
+- `market_impact_coefficient` / `market_impact_volatility_floor` / `max_market_impact_bps`：平方根冲击系数、年化波动率下限和单边冲击上限。
 - `max_participation_of_20d_amount`：订单金额占过去 20 日平均成交额的上限。
 - `rebalance_retry_days`：因涨跌停、停牌或资金不足导致未成交时的最大尝试天数。
 - `fee_schedule`：历史费率生效区间；区间必须连续且不得重叠。
@@ -354,12 +397,12 @@ python run.py result-verify --output results/public_research/robustness --strict
 
 ## 七、已知局限
 
-- 日线数据只能判断开盘是否触及涨跌停，不能模拟集合竞价排队、盘口深度、部分成交和盘中价格路径。
+- 日线数据只能判断开盘是否触及涨跌停；容量模型可以生成部分成交，但不能重放集合竞价排队、盘口深度、真实逐笔成交和盘中价格路径。
 - Tushare 数据可能修订，接口权限和字段也可能变化；v1.4 会冻结缓存指纹，但仍应把数据目录与研究结果一同归档。
 - 指数历史成分降低了幸存者偏差，但不能消除指数编制本身的选择偏差。
 - 分红送股已进入股份账本，但个人红利税与持有期相关，复杂税务仍需券商级清算数据。
 - 普通现金分红、送股和退市已处理；配股、换股吸收合并、破产重整等特殊事件仍需扩展。
-- 默认因子仍全部来自价格路径；成交额只做可交易性过滤，市值只用于风格控制，没有基本面质量、估值、盈利修正或完整协方差风险模型。
+- 默认因子仍全部来自价格路径；成交额只做可交易性过滤，市值只用于风格控制，没有基本面质量、估值或盈利修正。v1.6 协方差是长-only 收缩最小方差近似，不是完整 Barra 风险模型或精确二次规划器。
 - 申万行业成员和每日市值依赖数据源历史覆盖与修订；下载后的 v4 缓存与 `reproducibility.json` 必须和结果一起归档。
 - 行业/市值残差化是截面线性控制，不等于 Barra 类多因子风险模型，也不保证实际组合暴露严格为零。
 - 默认基准已切换为全收益指数，但实际数据源是否完整仍应通过 `validate-data` 确认。
@@ -375,7 +418,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 python -m unittest discover -s tests -v
 ```
 
-当前包含 66 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、NaN/非法 OHLC、行情/业绩基准/择时指数/行业缺口、择时与业绩基准隔离、数据源数字日期、行业区间覆盖、旧缓存拒绝、成分快照断档、历史时点行业、未来数据隔离、FIP 路径方向、冻结 Alpha 对照、负权重拒绝、排名缓冲、行业/单股权重约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、现金分红、送股、退市核销、陈旧估值、暴露报表、因子消融、成本压力、滚动样本外、相对输出目录封存、公开零调仓区间、公开成分区间边界、逐月行情覆盖审计、停牌锁仓、实验登记幂等性和严格/公开缓存篡改检测。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
+当前包含 83 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、数据/缓存完整性、未来数据隔离、冻结 Alpha 对照、排名缓冲、行业/单股约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、公司行动、研究封存，以及 v1.6 协方差分散/历史不足回退/防前视、换手平滑、冲击单调性/上限、组合可行性、容量部分成交与三日重试、低于整手容量拒单、订单审计、CLI 参数路由、严格/公开四臂归因、公开冲击成本账本和公开产物 SHA256 封存。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
 
 ## 九、项目结构
 
@@ -388,6 +431,8 @@ a_share_quant/
 ├── V1.5_ALPHA.md       # Alpha 公式、冻结权重和历史检验边界
 ├── V1.5_VALIDATION.md  # 自动化验收、合成对照与公开数据续传状态
 ├── V1.5.1_GOVERNANCE.md # 默认回退、晋级状态、数据覆盖审计和 v1.6 边界
+├── V1.6_PORTFOLIO_EXECUTION.md # 组合/成交公式、冻结参数、归因和晋级边界
+├── V1.6_VALIDATION.md # 自动化验收、合成四臂结果和真实数据复核命令
 ├── V1.4_TRUSTWORTHINESS.md
 ├── V1.2_VALIDATION.md  # 改造验收、合成对照和压力结果
 ├── src/ashare_quant/
@@ -397,9 +442,11 @@ a_share_quant/
 │   ├── config.py       # 配置与参数校验
 │   ├── data.py         # Tushare 下载、缓存、数据校验、离线演示
 │   ├── factors.py      # 因子、动态成分、选股、风险开关与权重
+│   ├── portfolio.py    # 逆波动率基线、收缩协方差和换手平滑
+│   ├── execution.py    # 固定滑点/平方根冲击公式与模型治理
 │   ├── provenance.py   # 数据、代码、配置与环境指纹
 │   ├── report.py       # 指标、暴露、CSV、PNG 和 HTML 报告
-│   └── research.py     # 冻结 Alpha 对照、因子消融、成本压力和滚动样本外
+│   └── research.py     # Alpha、组合/成交归因、消融、成本压力和滚动评估
 └── tests/test_quant.py
 ```
 

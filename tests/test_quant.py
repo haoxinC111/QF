@@ -33,6 +33,16 @@ from ashare_quant.factors import (
     _capped_allocation,
     _group_capped_allocation,
 )
+from ashare_quant.execution import (
+    DEFAULT_EXECUTION_MODEL,
+    EXECUTION_MODEL_V1_6,
+    market_impact_bps,
+)
+from ashare_quant.portfolio import (
+    DEFAULT_PORTFOLIO_MODEL,
+    PORTFOLIO_MODEL_V1_6,
+    allocate_portfolio,
+)
 from ashare_quant.report import (
     calculate_metrics,
     industry_exposure_table,
@@ -42,6 +52,7 @@ from ashare_quant.research import (
     run_alpha_comparison,
     run_cost_stress,
     run_factor_ablation,
+    run_implementation_comparison,
     run_rolling_oos,
     write_research_suite,
 )
@@ -82,6 +93,17 @@ class AllocationAndConfigTests(unittest.TestCase):
         governance = alpha_profile_governance(strategy.alpha_profile)
         self.assertEqual(governance["lifecycle_status"], "promoted")
         self.assertEqual(governance["promotion_decision"], "promoted")
+
+    def test_v1_6_models_are_opt_in(self) -> None:
+        config = AppConfig()
+        self.assertEqual(
+            config.portfolio.construction_model,
+            DEFAULT_PORTFOLIO_MODEL,
+        )
+        self.assertEqual(
+            config.execution.market_impact_model,
+            DEFAULT_EXECUTION_MODEL,
+        )
 
     def test_yaml_can_explicitly_select_experimental_alpha(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -144,6 +166,119 @@ class AllocationAndConfigTests(unittest.TestCase):
         self.assertLessEqual(
             float(result.groupby(industries).sum().max()), 0.30 + 1e-12
         )
+
+    def test_shrinkage_portfolio_rewards_a_diversifier(self) -> None:
+        rng = np.random.default_rng(2026)
+        common = rng.normal(0.0, 0.01, 160)
+        independent = rng.normal(0.0, 0.01, 160)
+        returns = pd.DataFrame(
+            {
+                "A": common,
+                "B": common + rng.normal(0.0, 0.0005, 160),
+                "C": independent,
+            }
+        )
+        allocation = allocate_portfolio(
+            model=PORTFOLIO_MODEL_V1_6,
+            inverse_risk=pd.Series(1.0, index=list("ABC")),
+            total=1.0,
+            stock_cap=1.0,
+            groups=pd.Series(["X", "Y", "Z"], index=list("ABC")),
+            group_cap=1.0,
+            returns=returns,
+            covariance_lookback_days=120,
+            minimum_covariance_observations=60,
+            covariance_shrinkage=0.5,
+            minimum_variance_blend=1.0,
+            turnover_smoothing=0.0,
+        )
+        self.assertEqual(allocation.status, "applied")
+        self.assertGreater(allocation.weights["C"], allocation.weights["A"])
+        self.assertGreater(allocation.weights["C"], allocation.weights["B"])
+        self.assertAlmostEqual(float(allocation.weights.sum()), 1.0, places=10)
+
+    def test_turnover_smoothing_moves_target_toward_current_book(self) -> None:
+        rng = np.random.default_rng(7)
+        returns = pd.DataFrame(
+            rng.normal(0.0, [0.008, 0.012, 0.018], size=(140, 3)),
+            columns=list("ABC"),
+        )
+        current = {"A": 0.10, "B": 0.20, "C": 0.70}
+        common = dict(
+            model=PORTFOLIO_MODEL_V1_6,
+            inverse_risk=pd.Series([3.0, 2.0, 1.0], index=list("ABC")),
+            total=1.0,
+            stock_cap=1.0,
+            groups=pd.Series(["X", "Y", "Z"], index=list("ABC")),
+            group_cap=1.0,
+            returns=returns,
+            current_weights=current,
+            covariance_lookback_days=120,
+            minimum_covariance_observations=60,
+            covariance_shrinkage=0.5,
+            minimum_variance_blend=0.5,
+        )
+        raw = allocate_portfolio(**common, turnover_smoothing=0.0)
+        smoothed = allocate_portfolio(**common, turnover_smoothing=0.7)
+        current_series = pd.Series(current)
+        raw_distance = float((raw.weights - current_series).abs().sum())
+        smoothed_distance = float((smoothed.weights - current_series).abs().sum())
+        self.assertLess(smoothed_distance, raw_distance)
+
+    def test_v1_6_portfolio_falls_back_on_short_covariance_history(self) -> None:
+        allocation = allocate_portfolio(
+            model=PORTFOLIO_MODEL_V1_6,
+            inverse_risk=pd.Series(1.0, index=list("ABC")),
+            total=0.9,
+            stock_cap=0.4,
+            groups=pd.Series(["X", "Y", "Z"], index=list("ABC")),
+            group_cap=0.5,
+            returns=pd.DataFrame(np.zeros((12, 3)), columns=list("ABC")),
+            covariance_lookback_days=120,
+            minimum_covariance_observations=60,
+        )
+        self.assertEqual(
+            allocation.status,
+            "fallback_insufficient_covariance",
+        )
+        self.assertAlmostEqual(float(allocation.weights.sum()), 0.9, places=10)
+
+    def test_square_root_impact_is_monotonic_and_capped(self) -> None:
+        low = market_impact_bps(
+            model=EXECUTION_MODEL_V1_6,
+            annualized_volatility=0.20,
+            participation_rate=0.01,
+            coefficient=0.5,
+            annualized_volatility_floor=0.10,
+            maximum_bps=50.0,
+        )
+        high = market_impact_bps(
+            model=EXECUTION_MODEL_V1_6,
+            annualized_volatility=0.40,
+            participation_rate=0.09,
+            coefficient=0.5,
+            annualized_volatility_floor=0.10,
+            maximum_bps=50.0,
+        )
+        capped = market_impact_bps(
+            model=EXECUTION_MODEL_V1_6,
+            annualized_volatility=2.0,
+            participation_rate=1.0,
+            coefficient=2.0,
+            annualized_volatility_floor=0.10,
+            maximum_bps=50.0,
+        )
+        fixed = market_impact_bps(
+            model=DEFAULT_EXECUTION_MODEL,
+            annualized_volatility=2.0,
+            participation_rate=1.0,
+            coefficient=2.0,
+            annualized_volatility_floor=0.10,
+            maximum_bps=50.0,
+        )
+        self.assertGreater(high, low)
+        self.assertEqual(capped, 50.0)
+        self.assertEqual(fixed, 0.0)
 
     def test_historical_fee_boundaries(self) -> None:
         execution = AppConfig().execution
@@ -629,6 +764,175 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("z_drawdown_quality", styles)
 
 
+class V16ImplementationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bundle = make_demo_bundle(
+            seed=73,
+            start="2016-01-04",
+            end="2020-12-31",
+            symbols=30,
+        )
+        base = research_config("2019-12-31")
+        cls.config = replace(
+            base,
+            portfolio=replace(
+                base.portfolio,
+                construction_model=PORTFOLIO_MODEL_V1_6,
+            ),
+            execution=replace(
+                base.execution,
+                market_impact_model=EXECUTION_MODEL_V1_6,
+            ),
+        )
+        cls.result = Backtester(cls.bundle, cls.config).run()
+
+    def test_alpha_selection_is_unchanged_by_portfolio_model(self) -> None:
+        signal_date = pd.Timestamp("2018-06-29")
+        baseline = MultiFactorStrategy(
+            self.bundle,
+            self.config.strategy,
+            replace(
+                self.config.portfolio,
+                construction_model=DEFAULT_PORTFOLIO_MODEL,
+            ),
+        ).generate(signal_date)
+        experimental = MultiFactorStrategy(
+            self.bundle,
+            self.config.strategy,
+            self.config.portfolio,
+        ).generate(signal_date)
+        self.assertEqual(
+            list(baseline.selection["symbol"]),
+            list(experimental.selection["symbol"]),
+        )
+
+    def test_v1_6_covariance_does_not_read_future_prices(self) -> None:
+        signal_date = pd.Timestamp("2018-06-29")
+        original = MultiFactorStrategy(
+            self.bundle,
+            self.config.strategy,
+            self.config.portfolio,
+        ).generate(signal_date)
+        changed = make_demo_bundle(
+            seed=73,
+            start="2016-01-04",
+            end="2020-12-31",
+            symbols=30,
+        )
+        future = changed.bars["date"].gt(signal_date)
+        changed.bars.loc[
+            future,
+            ["open", "high", "low", "close"],
+        ] *= 100.0
+        changed_plan = MultiFactorStrategy(
+            changed,
+            self.config.strategy,
+            self.config.portfolio,
+        ).generate(signal_date)
+        self.assertEqual(original.weights.keys(), changed_plan.weights.keys())
+        for symbol in original.weights:
+            self.assertAlmostEqual(
+                original.weights[symbol],
+                changed_plan.weights[symbol],
+                places=12,
+            )
+
+    def test_v1_6_portfolio_remains_feasible_and_auditable(self) -> None:
+        selections = self.result.selections
+        self.assertEqual(
+            set(selections["portfolio_model"]),
+            {PORTFOLIO_MODEL_V1_6},
+        )
+        self.assertEqual(set(selections["portfolio_status"]), {"applied"})
+        self.assertTrue((selections["covariance_observations"] >= 60).all())
+        self.assertLessEqual(
+            float(selections["target_weight"].max()),
+            self.config.strategy.max_stock_weight + 1e-12,
+        )
+        industry = selections.groupby(
+            ["signal_date", "industry_code"]
+        )["target_weight"].sum()
+        self.assertLessEqual(
+            float(industry.max()),
+            self.config.strategy.max_industry_weight + 1e-12,
+        )
+
+    def test_v1_6_execution_writes_fill_and_impact_ledger(self) -> None:
+        trades = self.result.trades
+        required = {
+            "requested_shares",
+            "remaining_shares",
+            "reference_price",
+            "participation_cap_notional",
+            "participation_rate",
+            "market_impact_bps",
+            "modeled_slippage_bps",
+            "realized_slippage_cost",
+        }
+        self.assertTrue(required.issubset(trades.columns))
+        self.assertEqual(set(trades["execution_model"]), {EXECUTION_MODEL_V1_6})
+        self.assertTrue((trades["market_impact_bps"] > 0).all())
+        self.assertLessEqual(
+            float(trades["participation_rate"].max()),
+            self.config.execution.max_participation_of_20d_amount + 1e-12,
+        )
+        self.assertTrue((trades["shares"] <= trades["requested_shares"] + 1e-12).all())
+
+    def test_capacity_partial_fills_are_retried_and_audited(self) -> None:
+        constrained = replace(
+            self.config,
+            backtest=replace(self.config.backtest, end_date="2018-06-29"),
+            execution=replace(
+                self.config.execution,
+                max_participation_of_20d_amount=0.00005,
+                rebalance_retry_days=3,
+            ),
+        )
+        result = Backtester(self.bundle, constrained).run()
+        partial = result.orders.loc[result.orders["status"].eq("PARTIAL")]
+        cancelled = result.orders.loc[
+            result.orders["reason"].eq("retry_window_expired")
+        ]
+        self.assertFalse(partial.empty)
+        self.assertFalse(cancelled.empty)
+        self.assertEqual(set(result.orders["attempt"]), {1, 2, 3})
+        self.assertTrue((partial["remaining_shares"] > 0).all())
+        self.assertLessEqual(
+            float(partial["participation_rate"].max()),
+            constrained.execution.max_participation_of_20d_amount + 1e-12,
+        )
+
+    def test_sub_lot_capacity_is_retried_instead_of_silently_dropped(self) -> None:
+        constrained = replace(
+            self.config,
+            backtest=replace(self.config.backtest, end_date="2018-06-29"),
+            execution=replace(
+                self.config.execution,
+                max_participation_of_20d_amount=0.000001,
+                rebalance_retry_days=3,
+            ),
+        )
+        result = Backtester(self.bundle, constrained).run()
+        rejected = result.orders.loc[result.orders["status"].eq("REJECTED")]
+        self.assertFalse(rejected.empty)
+        self.assertEqual(set(rejected["reason"]), {"participation_cap"})
+        self.assertEqual(set(rejected["attempt"]), {1, 2, 3})
+        self.assertTrue(
+            result.orders["reason"].eq("retry_window_expired").any()
+        )
+
+    def test_v1_6_governance_and_costs_are_reported(self) -> None:
+        metrics = calculate_metrics(self.result, self.config)
+        self.assertEqual(metrics["portfolio_model_status"], "experimental")
+        self.assertEqual(metrics["execution_model_status"], "experimental")
+        self.assertEqual(
+            metrics["portfolio_promotion_decision"],
+            "pending_validation",
+        )
+        self.assertGreater(metrics["estimated_market_impact_cost"], 0.0)
+
+
 class ResearchSuiteTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -695,6 +999,27 @@ class ResearchSuiteTests(unittest.TestCase):
         )
         self.assertEqual(set(result["slippage_bps"]), {5.0, 10.0})
         self.assertTrue((result["commission_multiplier"] == 1.0).all())
+
+    def test_implementation_comparison_has_four_attribution_arms(self) -> None:
+        result = run_implementation_comparison(self.bundle, self.config)
+        self.assertEqual(
+            set(result["variant"]),
+            {
+                "baseline_v1_5_1",
+                "portfolio_only_v1_6",
+                "execution_only_v1_6",
+                "combined_v1_6",
+            },
+        )
+        self.assertEqual(set(result["alpha_profile"]), {DEFAULT_ALPHA_PROFILE})
+        self.assertEqual(
+            set(result["portfolio_model"]),
+            {DEFAULT_PORTFOLIO_MODEL, PORTFOLIO_MODEL_V1_6},
+        )
+        self.assertEqual(
+            set(result["execution_model"]),
+            {DEFAULT_EXECUTION_MODEL, EXECUTION_MODEL_V1_6},
+        )
 
     def test_rolling_oos_uses_non_overlapping_windows(self) -> None:
         result = run_rolling_oos(

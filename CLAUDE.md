@@ -24,6 +24,7 @@
   - `v1.4.2`：新浪下载改为并发 HTTP + 单解码线程，加入跨平台压力测试
   - `v1.5.0`：新增共享质量动量 Alpha、冻结版本对照、逐因子消融和防前视测试
   - `v1.5.1`：恢复 legacy 默认 Alpha，标记 v1.5 候选治理状态，补充公开数据逐月覆盖审计
+  - `v1.6.0`：新增收缩协方差/换手平滑组合候选、平方根市场冲击、成交审计和四臂归因
 
 ## 3. ZIP 处理标准流程
 
@@ -36,7 +37,7 @@
    ```
 2. **核对顶层结构**：有的版本把项目放在 `a_share_quant/` 子目录下，有的直接放在根目录。解压后先确认 `run.py` 和 `src/ashare_quant/` 的位置。
 3. **与当前代码做差异比较**：
-   - 核心模块：`src/ashare_quant/{config,data,factors,backtest,report,cli,research,public_research,provenance}.py`
+   - 核心模块：`src/ashare_quant/{config,data,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
    - 配置：`config.example.yaml`、`pyproject.toml`、`requirements*.txt`
    - 文档：`README.md`、`V1.*_VALIDATION.md`、`PUBLIC_SOURCE_AUDIT.md`
    - 测试：`tests/`
@@ -73,6 +74,7 @@
 ### 4.5 配置
 - 用 `config.example.yaml` 生成 `config.yaml`，不要直接修改示例文件。
 - v1.4 配置新增 `data.regime_index`；升级时必须确认它是价格指数，并与全收益 `benchmark_index` 分离。
+- v1.6 配置新增 `portfolio` 段和 `execution.market_impact_*`；生产默认必须保持 `inverse_vol_v1_4 + fixed_bps`，新模型只能显式启用并标记实验状态。
 
 ## 5. 何时必须提问或上报
 
