@@ -20,7 +20,9 @@ import requests
 
 from .alpha import (
     ALPHA_MODEL_VERSION,
+    DEFAULT_ALPHA_PROFILE,
     QUALITY_MOMENTUM_V1_5_WEIGHTS,
+    alpha_profile_governance,
     build_price_alpha_features,
 )
 from .factors import _group_capped_allocation, _winsorized_zscore
@@ -126,6 +128,7 @@ class PublicStrategyConfig:
     commission_rate: float = 0.00025
     slippage_bps: float = 5.0
     annual_cash_rate: float = 0.015
+    minimum_month_end_quote_coverage: float = 0.95
     regime_symbol: str = PUBLIC_REGIME_SYMBOL
     performance_benchmark_symbol: str = PUBLIC_PERFORMANCE_BENCHMARK_SYMBOL
 
@@ -145,6 +148,8 @@ class PublicStrategyConfig:
             raise ValueError("至少需要一个正的因子权重")
         if self.volatility_lookback < 20:
             raise ValueError("volatility_lookback 至少为 20")
+        if not 0 < self.minimum_month_end_quote_coverage <= 1:
+            raise ValueError("minimum_month_end_quote_coverage 必须在 (0, 1] 内")
         if not self.regime_symbol or not self.performance_benchmark_symbol:
             raise ValueError("择时指数与业绩基准代码不能为空")
         if self.regime_symbol == self.performance_benchmark_symbol:
@@ -1222,6 +1227,108 @@ def _select_targets(
     return target.to_dict(), selected.reset_index(drop=True), regime
 
 
+def _audit_public_data_quality(
+    *,
+    membership: pd.DataFrame,
+    relevant_symbols: Iterable[str],
+    bars: pd.DataFrame,
+    signal_dates: Iterable[pd.Timestamp],
+    exact_by_date: dict[pd.Timestamp, pd.DataFrame],
+    config: PublicStrategyConfig,
+    cache_manifest: dict[str, object],
+    missing_execution_events: int,
+    missing_execution_symbols: Iterable[str],
+    stale_marks: int,
+) -> dict[str, object]:
+    """Build an auditable coverage report; file hashes alone cannot prove completeness."""
+    relevant = set(map(str, relevant_symbols))
+    available = set(bars["symbol"].astype(str).unique())
+    members_without_any_bars = sorted(relevant.difference(available))
+    monthly_records: list[dict[str, object]] = []
+    for signal_date in sorted(map(pd.Timestamp, signal_dates)):
+        active = set(members_at(membership, signal_date)["symbol"].astype(str))
+        exact = exact_by_date.get(signal_date, pd.DataFrame())
+        quoted = set(exact.get("symbol", pd.Series(dtype=str)).astype(str))
+        quoted_active = active.intersection(quoted)
+        missing = sorted(active.difference(quoted))
+        monthly_records.append(
+            {
+                "signal_date": str(signal_date.date()),
+                "active_members": len(active),
+                "quoted_active_members": len(quoted_active),
+                "missing_member_count": len(missing),
+                "coverage": len(quoted_active) / max(len(active), 1),
+                "missing_symbols": missing,
+            }
+        )
+
+    coverage_values = [float(record["coverage"]) for record in monthly_records]
+    member_counts = [int(record["active_members"]) for record in monthly_records]
+    below_threshold = [
+        record
+        for record in monthly_records
+        if float(record["coverage"])
+        < config.minimum_month_end_quote_coverage
+    ]
+    warnings: list[str] = []
+    if members_without_any_bars:
+        warnings.append(
+            "历史成分中存在完全无行情证券: "
+            + ", ".join(members_without_any_bars)
+        )
+    if below_threshold:
+        warnings.append(
+            f"{len(below_threshold)} 个信号月的成分行情覆盖低于 "
+            f"{config.minimum_month_end_quote_coverage:.2%}"
+        )
+
+    return {
+        "data_quality_status": "warning" if warnings else "pass",
+        "data_quality_warnings": warnings,
+        "membership_intervals": len(membership),
+        "relevant_unique_members": len(relevant),
+        "members_with_bars": len(available.intersection(relevant)),
+        "members_without_any_bars": members_without_any_bars,
+        "member_bar_coverage": len(available.intersection(relevant))
+        / max(len(relevant), 1),
+        "minimum_month_end_quote_coverage": (
+            config.minimum_month_end_quote_coverage
+        ),
+        "month_end_quote_coverage_min": min(coverage_values)
+        if coverage_values
+        else 0.0,
+        "month_end_quote_coverage_median": float(np.median(coverage_values))
+        if coverage_values
+        else 0.0,
+        "month_end_members_min": min(member_counts) if member_counts else 0,
+        "month_end_members_max": max(member_counts) if member_counts else 0,
+        "month_end_quote_coverage": monthly_records,
+        "month_end_quote_coverage_below_threshold": below_threshold,
+        "bar_rows": len(bars),
+        "first_bar_date": str(bars["date"].min().date()),
+        "last_bar_date": str(bars["date"].max().date()),
+        # Backward-compatible count plus explicit event/list fields.
+        "missing_execution_symbols": missing_execution_events,
+        "missing_execution_event_count": missing_execution_events,
+        "missing_execution_symbol_list": sorted(
+            set(map(str, missing_execution_symbols))
+        ),
+        "stale_position_marks": stale_marks,
+        "adjustment": (
+            f"{cache_manifest.get('source', 'public cache')} "
+            "hfq total-return price"
+        ),
+        "regime_symbol": config.regime_symbol,
+        "performance_benchmark_symbol": config.performance_benchmark_symbol,
+        "known_limitations": [
+            "历史成分来自第三方对中证官方公告的规范化整理，并非中证公司原始机器接口",
+            "公开接口没有可靠的历史 ST、历史行业和历史市值快照，因此本测试关闭对应过滤/中性化",
+            "权重级回测未模拟 100 股整手、最低 5 元佣金和涨跌停排队；执行日停牌时保留旧持仓、新目标留现金且不重试",
+            "沪深300ETF后复权净值作为可投资基准，含基金费率和跟踪误差",
+        ],
+    }
+
+
 def run_public_backtest(
     membership_path: str | Path,
     cache_dir: str | Path,
@@ -1271,7 +1378,8 @@ def run_public_backtest(
     curve_rows: list[dict[str, object]] = []
     selection_frames: list[pd.DataFrame] = []
     rebalance_rows: list[dict[str, object]] = []
-    missing_execution_symbols = 0
+    missing_execution_events = 0
+    missing_execution_symbol_set: set[str] = set()
     stale_marks = 0
     prior_close: dict[str, float] = {}
     cash_daily = (1.0 + config.annual_cash_rate) ** (1.0 / 252.0) - 1.0
@@ -1301,7 +1409,9 @@ def run_public_backtest(
                 and float(today.at[symbol, "volume"]) > 0
                 and float(today.at[symbol, "amount"]) > 0
             }
-            missing_execution_symbols += len(set(requested_target) - tradable_symbols)
+            missing_for_execution = set(requested_target) - tradable_symbols
+            missing_execution_events += len(missing_for_execution)
+            missing_execution_symbol_set.update(missing_for_execution)
             outcome = _rebalance_public_positions(
                 positions,
                 requested_target,
@@ -1387,42 +1497,24 @@ def run_public_backtest(
     curve["benchmark_drawdown"] = curve["benchmark_nav"] / curve["benchmark_nav"].cummax() - 1.0
     selections = pd.concat(selection_frames, ignore_index=True) if selection_frames else pd.DataFrame()
     rebalances = pd.DataFrame(rebalance_rows)
-    available = set(bars["symbol"].unique())
-    monthly_coverage: list[float] = []
-    monthly_member_counts: list[int] = []
-    for signal_date in sorted(signal_dates):
-        active = set(members_at(membership, signal_date)["symbol"].astype(str))
-        quoted = set(exact_by_date.get(signal_date, pd.DataFrame()).get("symbol", pd.Series(dtype=str)).astype(str))
-        monthly_member_counts.append(len(active))
-        monthly_coverage.append(len(active.intersection(quoted)) / max(len(active), 1))
     manifest_path = Path(cache_dir) / "manifest.json"
     cache_manifest = (
         json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     )
-    quality = {
-        "membership_intervals": len(membership),
-        "relevant_unique_members": len(symbols),
-        "members_with_bars": len(available.intersection(symbols)),
-        "member_bar_coverage": len(available.intersection(symbols)) / max(len(symbols), 1),
-        "month_end_quote_coverage_min": min(monthly_coverage) if monthly_coverage else 0.0,
-        "month_end_quote_coverage_median": float(np.median(monthly_coverage)) if monthly_coverage else 0.0,
-        "month_end_members_min": min(monthly_member_counts) if monthly_member_counts else 0,
-        "month_end_members_max": max(monthly_member_counts) if monthly_member_counts else 0,
-        "bar_rows": len(bars),
-        "first_bar_date": str(bars["date"].min().date()),
-        "last_bar_date": str(bars["date"].max().date()),
-        "missing_execution_symbols": missing_execution_symbols,
-        "stale_position_marks": stale_marks,
-        "adjustment": f"{cache_manifest.get('source', 'public cache')} hfq total-return price",
-        "regime_symbol": config.regime_symbol,
-        "performance_benchmark_symbol": config.performance_benchmark_symbol,
-        "known_limitations": [
-            "历史成分来自第三方对中证官方公告的规范化整理，并非中证公司原始机器接口",
-            "公开接口没有可靠的历史 ST、历史行业和历史市值快照，因此本测试关闭对应过滤/中性化",
-            "权重级回测未模拟 100 股整手、最低 5 元佣金和涨跌停排队；执行日停牌时保留旧持仓、新目标留现金且不重试",
-            "沪深300ETF后复权净值作为可投资基准，含基金费率和跟踪误差",
-        ],
-    }
+    quality = _audit_public_data_quality(
+        membership=membership,
+        relevant_symbols=symbols,
+        bars=bars,
+        signal_dates=signal_dates,
+        exact_by_date=exact_by_date,
+        config=config,
+        cache_manifest=cache_manifest,
+        missing_execution_events=missing_execution_events,
+        missing_execution_symbols=missing_execution_symbol_set,
+        stale_marks=stale_marks,
+    )
+    for warning in quality["data_quality_warnings"]:
+        LOGGER.warning("公开数据质量: %s", warning)
     return PublicBacktestResult(config, curve, selections, rebalances, quality)
 
 
@@ -1523,9 +1615,38 @@ def public_strategy_variants(base: PublicStrategyConfig | None = None) -> list[P
     ]
 
 
+def _public_strategy_governance(name: str) -> dict[str, object]:
+    if name == ALPHA_MODEL_VERSION:
+        return alpha_profile_governance(ALPHA_MODEL_VERSION)
+    return {
+        "lifecycle_status": "historical_research_baseline",
+        "promotion_decision": "not_applicable",
+        "default_eligible": False,
+        "reason": "公开通道研究方案，不等同于严格通道生产默认配置",
+    }
+
+
 def _slice_metrics(curve: pd.DataFrame, start: str, end: str, column: str) -> dict[str, float | int]:
     subset = curve.loc[curve["date"].between(pd.Timestamp(start), pd.Timestamp(end))]
     return _calculate_metrics(subset, column)
+
+
+def _annualized_period_turnover(
+    rebalances: pd.DataFrame,
+    start: str,
+    end: str,
+) -> float:
+    years = max(
+        (pd.Timestamp(end) - pd.Timestamp(start)).days / 365.2425,
+        1.0,
+    )
+    required = {"execution_date", "one_way_turnover"}
+    if rebalances.empty or not required.issubset(rebalances.columns):
+        return 0.0
+    within_period = pd.to_datetime(rebalances["execution_date"]).between(
+        start, end
+    )
+    return float(rebalances.loc[within_period, "one_way_turnover"].sum() / years)
 
 
 def write_public_research(
@@ -1575,21 +1696,21 @@ def write_public_research(
             ]
         )
         for period, (start, end) in periods.items():
+            governance = _public_strategy_governance(variant.name)
             strategy_metrics = _slice_metrics(result.equity_curve, start, end, "nav")
             benchmark_metrics = _slice_metrics(result.equity_curve, start, end, "benchmark_nav")
-            turnover = result.rebalances.loc[
-                pd.to_datetime(result.rebalances["execution_date"]).between(start, end),
-                "one_way_turnover",
-            ].sum()
-            years = max((pd.Timestamp(end) - pd.Timestamp(start)).days / 365.2425, 1.0)
             metric_rows.append(
                 {
                     "strategy": variant.name,
+                    "strategy_status": governance["lifecycle_status"],
+                    "promotion_decision": governance["promotion_decision"],
                     "period": period,
                     **strategy_metrics,
                     "benchmark_cagr": benchmark_metrics["cagr"],
                     "benchmark_max_drawdown": benchmark_metrics["max_drawdown"],
-                    "annual_one_way_turnover": float(turnover / years),
+                    "annual_one_way_turnover": _annualized_period_turnover(
+                        result.rebalances, start, end
+                    ),
                 }
             )
     metrics = pd.DataFrame(metric_rows)
@@ -1624,10 +1745,17 @@ def write_public_research(
     def percentage(value: object) -> str:
         return "—" if pd.isna(value) else f"{float(value):.2%}"
 
+    def percentage_points(value: object) -> str:
+        return "—" if pd.isna(value) else f"{float(value) * 100:+.2f} pp"
+
     report_lines = [
         "# A股公开数据分段回测报告",
         "",
         "本报告使用历史时点沪深300成分区间、公开日线后复权价格、月末信号和下一交易日开盘成交。所有结果均已计入双边佣金、历史卖出印花税、过户费和单边滑点。",
+        "",
+        f"严格通道生产默认 Alpha 为 `{DEFAULT_ALPHA_PROFILE}`。"
+        f"`{ALPHA_MODEL_VERSION}` 的生命周期状态为 `experimental`，"
+        "本轮默认晋级决定为 `rejected`；公开回放继续保留它仅用于审计和前瞻观察。",
         "",
         "## 分期结果",
         "",
@@ -1644,12 +1772,13 @@ def write_public_research(
     report_lines.extend(
         [
             "",
-            "## v1.5 Alpha 同约束增量",
+            "## v1.5 Alpha 同约束研究对照",
             "",
             "`quality_momentum_v1_5` 与 `momentum_focus_15` 使用相同持股数、排名缓冲、"
-            "单股上限和风险仓位；下表只比较选股 Alpha 变化。",
+            "单股上限和风险仓位；下表只比较选股 Alpha 变化。"
+            "`momentum_focus_15` 是公开研究基准，不是严格通道的 `legacy_v1_4` 默认策略。",
             "",
-            "| 区间 | v1.4 年化 | v1.5 年化 | 年化差 | 回撤差 | 夏普差 |",
+            "| 区间 | momentum_focus_15 年化 | quality_momentum_v1_5 年化 | 年化改善 | 最大回撤改善（正值更好） | 夏普差 |",
             "| --- | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
@@ -1659,8 +1788,8 @@ def write_public_research(
         report_lines.append(
             f"| {period} | {percentage(legacy['cagr'])} | "
             f"{percentage(enhanced['cagr'])} | "
-            f"{percentage(enhanced['cagr'] - legacy['cagr'])} | "
-            f"{percentage(enhanced['max_drawdown'] - legacy['max_drawdown'])} | "
+            f"{percentage_points(enhanced['cagr'] - legacy['cagr'])} | "
+            f"{percentage_points(enhanced['max_drawdown'] - legacy['max_drawdown'])} | "
             f"{enhanced['sharpe'] - legacy['sharpe']:.2f} |"
         )
     holdout = metrics.loc[
@@ -1675,6 +1804,7 @@ def write_public_research(
             f"- 已查看历史保留期年化最高的是 `{best_holdout['strategy']}`：{percentage(best_holdout['cagr'])}，最大回撤 {percentage(best_holdout['max_drawdown'])}。这只是预定义方案之间的比较，不是收益承诺。",
             f"- 该历史保留期是否达到 15%：{'是' if float(best_holdout['cagr']) >= 0.15 else '否'}。2022–2025 的结果已经被查看，今后不能再把它当作未触碰样本外反复调参。",
             "- 开发期、验证期与已查看保留期应一起看；下一段真正的前瞻验证应使用 2026 年以后未参与调参的数据或模拟盘。",
+            f"- `{ALPHA_MODEL_VERSION}` 未通过本轮默认晋级；不要把本表解释为 v1.4 默认策略已被替换。",
             "",
             "## 公开数据口径限制",
             "",
@@ -1682,10 +1812,27 @@ def write_public_research(
     )
     for limitation in first_result.data_quality["known_limitations"]:
         report_lines.append(f"- {limitation}")
+    missing_members = first_result.data_quality["members_without_any_bars"]
+    missing_text = ", ".join(missing_members) if missing_members else "无"
+    below_threshold = first_result.data_quality[
+        "month_end_quote_coverage_below_threshold"
+    ]
+    below_dates = ", ".join(
+        str(record["signal_date"]) for record in below_threshold
+    ) or "无"
+    report_lines.extend(
+        [
+            f"- 数据质量状态：`{first_result.data_quality['data_quality_status']}`；"
+            f"完全无行情的历史成员：{missing_text}。",
+            "- 月末行情覆盖告警阈值为 "
+            f"{first_result.data_quality['minimum_month_end_quote_coverage']:.2%}；"
+            f"低于阈值的信号月：{below_dates}。逐月分母、缺失数和证券列表见各策略的 `data_quality.json`。",
+        ]
+    )
     report_lines.append(
         "- 月末成分当日行情覆盖最低为 "
         f"{first_result.data_quality['month_end_quote_coverage_min']:.2%}、中位数为 "
-        f"{first_result.data_quality['month_end_quote_coverage_median']:.2%}；最低点发生在集中停牌时期，"
+        f"{first_result.data_quality['month_end_quote_coverage_median']:.2%}；"
         "无当日收盘价的证券不会进入当月新选择。"
     )
     report_lines.extend(
@@ -1709,6 +1856,8 @@ def write_public_research(
         "alpha_protocol": {
             "model": ALPHA_MODEL_VERSION,
             "weights": dict(QUALITY_MOMENTUM_V1_5_WEIGHTS),
+            "governance": alpha_profile_governance(ALPHA_MODEL_VERSION),
+            "strict_default_alpha_profile": DEFAULT_ALPHA_PROFILE,
             "parameter_search": "none",
             "historical_market_periods_seen_before_design": True,
         },
@@ -1720,6 +1869,22 @@ def write_public_research(
             "prospective_2026_onward": "researcher_managed_not_automatically_certified",
         },
         "variants": [asdict(value) for value in public_strategy_variants(base_config)],
+        "variant_governance": {
+            value.name: _public_strategy_governance(value.name)
+            for value in public_strategy_variants(base_config)
+        },
+        "data_quality": {
+            key: first_result.data_quality[key]
+            for key in [
+                "data_quality_status",
+                "data_quality_warnings",
+                "member_bar_coverage",
+                "members_without_any_bars",
+                "minimum_month_end_quote_coverage",
+                "month_end_quote_coverage_min",
+                "month_end_quote_coverage_below_threshold",
+            ]
+        },
         "limitations": next(iter(results.values())).data_quality["known_limitations"],
         "data_fingerprint_sha256": cache_manifest.get(
             "data_fingerprint_sha256"
@@ -1752,6 +1917,7 @@ def write_public_research(
             "parameters": "six_legacy_v1_3_plus_frozen_quality_momentum_v1_5",
             "historical_holdout_2022_2025": "seen",
             "prospective_holdout_start": "2026-01-01",
+            "candidate_promotion_decision": "rejected",
             "untouched_holdout_certified": False,
         },
         artifacts=[
@@ -1873,6 +2039,9 @@ def write_public_robustness(
         "但 2022–2025 市场结果已在旧策略研究中被查看，因此本页只属于历史回放，"
         "不能宣称为未触碰样本外。",
         "",
+        f"治理状态：`experimental`；默认晋级决定：`rejected`。"
+        f"严格通道继续以 `{DEFAULT_ALPHA_PROFILE}` 为生产默认 Alpha。",
+        "",
         "## 滑点压力",
         "",
         "| 单边滑点 | 区间 | 年化 | 最大回撤 | 夏普 |",
@@ -1888,6 +2057,9 @@ def write_public_robustness(
             "",
             "## 因子消融",
             "",
+            "删除一个因子后，剩余正权重会在综合分数中重新归一化，且因子彼此相关；"
+            "因此消融只表示当前组合下的边际证据，不能解释为单因子的独立因果贡献。",
+            "",
             "| 方案 | 区间 | 年化 | 最大回撤 | 夏普 |",
             "| --- | --- | ---: | ---: | ---: |",
         ]
@@ -1902,6 +2074,8 @@ def write_public_robustness(
     reproducibility = build_reproducibility_manifest(
         {
             "candidate": asdict(candidate),
+            "candidate_governance": alpha_profile_governance(ALPHA_MODEL_VERSION),
+            "strict_default_alpha_profile": DEFAULT_ALPHA_PROFILE,
             "periods": periods,
             "cost_slippage_bps": [5.0, 10.0, 20.0],
             "factor_ablation": list(factor_fields),
@@ -1921,6 +2095,7 @@ def write_public_robustness(
         experiment_type="public_robustness",
         protocol={
             "candidate": ALPHA_MODEL_VERSION,
+            "candidate_promotion_decision": "rejected",
             "historical_holdout_2022_2025": "seen",
             "optimization": "frozen_v1_5_weights_cost_stress_and_ablation_only",
             "untouched_holdout_certified": False,

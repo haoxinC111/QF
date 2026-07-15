@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 
+DEFAULT_ALPHA_PROFILE = "legacy_v1_4"
 ALPHA_MODEL_VERSION = "quality_momentum_v1_5"
 MOMENTUM_SKIP_DAYS = 21
 MOMENTUM_6M_DAYS = 126
@@ -44,7 +45,7 @@ LEGACY_V1_4_WEIGHTS: Mapping[str, float] = MappingProxyType({
 def identify_alpha_profile(weights: Mapping[str, float]) -> str:
     normalized = {str(name): float(value) for name, value in weights.items()}
     for profile, expected in {
-        "legacy_v1_4": LEGACY_V1_4_WEIGHTS,
+        DEFAULT_ALPHA_PROFILE: LEGACY_V1_4_WEIGHTS,
         ALPHA_MODEL_VERSION: QUALITY_MOMENTUM_V1_5_WEIGHTS,
     }.items():
         if normalized.keys() == expected.keys() and all(
@@ -53,6 +54,44 @@ def identify_alpha_profile(weights: Mapping[str, float]) -> str:
         ):
             return profile
     return "custom"
+
+
+def alpha_profile_weights(profile: str) -> Mapping[str, float]:
+    """Return a frozen named profile without silently accepting unknown names."""
+    profiles = {
+        DEFAULT_ALPHA_PROFILE: LEGACY_V1_4_WEIGHTS,
+        ALPHA_MODEL_VERSION: QUALITY_MOMENTUM_V1_5_WEIGHTS,
+    }
+    try:
+        return profiles[str(profile)]
+    except KeyError as exc:
+        raise ValueError(
+            "alpha_profile 仅支持 legacy_v1_4、quality_momentum_v1_5 或 custom"
+        ) from exc
+
+
+def alpha_profile_governance(profile: str) -> dict[str, object]:
+    """Describe whether an Alpha profile is allowed to be the production default."""
+    if profile == DEFAULT_ALPHA_PROFILE:
+        return {
+            "lifecycle_status": "promoted",
+            "promotion_decision": "promoted",
+            "default_eligible": True,
+            "reason": "v1.5.1 恢复的稳定生产默认配置",
+        }
+    if profile == ALPHA_MODEL_VERSION:
+        return {
+            "lifecycle_status": "experimental",
+            "promotion_decision": "rejected",
+            "default_eligible": False,
+            "reason": "公开历史验证未形成一致 Alpha 增量，保留为冻结研究候选",
+        }
+    return {
+        "lifecycle_status": "custom_unreviewed",
+        "promotion_decision": "not_evaluated",
+        "default_eligible": False,
+        "reason": "自定义权重尚未经过项目晋级审核",
+    }
 
 
 def _rolling_fraction(

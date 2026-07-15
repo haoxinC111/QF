@@ -28,21 +28,25 @@ backtest:
   output_dir: results/latest
 
 strategy:
+  # v1.5.1 治理热修复：生产默认恢复为 legacy_v1_4。
+  # 如需复核冻结实验候选，仅改为 quality_momentum_v1_5；结果会标记 experimental/rejected。
+  # 自定义权重时改为 custom，并显式填写下方八个 *_weight 字段。
+  alpha_profile: legacy_v1_4
   top_n: 20
   min_history_days: 252
   min_avg_amount_million: 100
   min_price: 3
   winsor_quantile: 0.05
   stock_trend_filter: true
-  # v1.5 quality_momentum：权重在历史重跑前冻结；成交额仅作准入门槛。
-  momentum_12_1_weight: 0.25
-  momentum_6_1_weight: 0.15
-  fip_momentum_weight: 0.25
-  trend_weight: 0.10
-  low_volatility_weight: 0.00
-  low_downside_volatility_weight: 0.15
-  drawdown_quality_weight: 0.10
-  liquidity_weight: 0.00
+  # alpha_profile: custom 时可启用以下示例（这里列的是 legacy_v1_4 权重）：
+  # momentum_12_1_weight: 0.35
+  # momentum_6_1_weight: 0.20
+  # fip_momentum_weight: 0.00
+  # trend_weight: 0.15
+  # low_volatility_weight: 0.20
+  # low_downside_volatility_weight: 0.00
+  # drawdown_quality_weight: 0.00
+  # liquidity_weight: 0.10
   volatility_lookback: 60
   benchmark_ma_days: 200
   risk_on_exposure: 0.95

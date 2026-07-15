@@ -9,8 +9,10 @@ import pandas as pd
 
 from .alpha import (
     ALPHA_MODEL_VERSION,
+    DEFAULT_ALPHA_PROFILE,
     LEGACY_V1_4_WEIGHTS,
     QUALITY_MOMENTUM_V1_5_WEIGHTS,
+    alpha_profile_governance,
 )
 from .backtest import Backtester
 from .config import AppConfig
@@ -82,7 +84,7 @@ def run_alpha_comparison(
 ) -> pd.DataFrame:
     """Compare frozen v1.4 and v1.5 alpha weights under identical controls."""
     profiles = {
-        "legacy_v1_4": LEGACY_V1_4_WEIGHTS,
+        DEFAULT_ALPHA_PROFILE: LEGACY_V1_4_WEIGHTS,
         ALPHA_MODEL_VERSION: QUALITY_MOMENTUM_V1_5_WEIGHTS,
     }
     records: list[dict[str, object]] = []
@@ -214,7 +216,7 @@ def write_research_suite(
     if not requested:
         raise ValueError("至少选择一个研究模式")
 
-    output = Path(output_dir)
+    output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
     if "alpha" in requested:
@@ -252,9 +254,20 @@ def write_research_suite(
         "test_years": test_years,
         "note": "滚动样本外使用冻结参数；训练窗只表示参数研究与冻结区间，不执行自动寻优。",
         "alpha_profiles": {
-            "legacy_v1_4": dict(LEGACY_V1_4_WEIGHTS),
+            DEFAULT_ALPHA_PROFILE: dict(LEGACY_V1_4_WEIGHTS),
             ALPHA_MODEL_VERSION: dict(QUALITY_MOMENTUM_V1_5_WEIGHTS),
         },
+        "alpha_profile_governance": {
+            DEFAULT_ALPHA_PROFILE: alpha_profile_governance(
+                DEFAULT_ALPHA_PROFILE
+            ),
+            ALPHA_MODEL_VERSION: alpha_profile_governance(ALPHA_MODEL_VERSION),
+        },
+        "default_alpha_profile": DEFAULT_ALPHA_PROFILE,
+        "ablation_interpretation": (
+            "删除因子后剩余权重会重新归一化；结果只表示当前组合下的边际证据，"
+            "不能解释为单因子的独立因果贡献。"
+        ),
         "evaluation_protocol": "fixed_parameter_rolling_evaluation",
         "automatic_parameter_fitting": False,
         "untouched_holdout_certified": False,

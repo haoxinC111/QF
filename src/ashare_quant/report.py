@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from .alpha import identify_alpha_profile
+from .alpha import alpha_profile_governance, identify_alpha_profile
 from .backtest import BacktestResult
 from .config import AppConfig
 from .provenance import (
@@ -234,8 +234,14 @@ def calculate_metrics(result: BacktestResult, config: AppConfig) -> dict[str, An
         else np.nan
     )
 
+    alpha_profile = identify_alpha_profile(config.strategy.factor_weights)
+    alpha_governance = alpha_profile_governance(alpha_profile)
     return {
-        "alpha_profile": identify_alpha_profile(config.strategy.factor_weights),
+        "alpha_profile": alpha_profile,
+        "alpha_profile_status": alpha_governance["lifecycle_status"],
+        "alpha_promotion_decision": alpha_governance["promotion_decision"],
+        "alpha_default_eligible": bool(alpha_governance["default_eligible"]),
+        "alpha_governance_reason": alpha_governance["reason"],
         "start_date": str(pd.Timestamp(curve["date"].iloc[0]).date()),
         "end_date": str(pd.Timestamp(curve["date"].iloc[-1]).date()),
         "trading_days": int(len(curve)),
@@ -383,6 +389,9 @@ def _html_report(
     image_base64: str,
 ) -> str:
     labels = {
+        "alpha_profile": "Alpha 配置",
+        "alpha_profile_status": "Alpha 状态",
+        "alpha_promotion_decision": "默认晋级决定",
         "total_return": "累计收益",
         "cagr": "年化收益",
         "annual_volatility": "年化波动",
@@ -414,6 +423,13 @@ def _html_report(
         "现金分红与送股由公司行动账本处理；复杂税务和特殊重组仍需人工复核。",
         "行业与市值中性化作用于选股分数；实际组合暴露请同时检查暴露 CSV。",
     ] + result.warnings
+    if metrics["alpha_profile_status"] != "promoted":
+        warnings.insert(
+            1,
+            f"当前 Alpha 为 {metrics['alpha_profile_status']}，"
+            f"默认晋级决定为 {metrics['alpha_promotion_decision']}："
+            f"{metrics['alpha_governance_reason']}。",
+        )
     warning_html = "".join(f"<li>{item}</li>" for item in warnings)
     config_text = yaml.safe_dump(config.to_dict(), allow_unicode=True, sort_keys=False)
     return f"""<!doctype html>
@@ -527,6 +543,9 @@ def write_report(
 
 def console_summary(metrics: dict[str, Any]) -> str:
     keys = [
+        ("alpha_profile", "Alpha 配置"),
+        ("alpha_profile_status", "Alpha 状态"),
+        ("alpha_promotion_decision", "默认晋级决定"),
         ("final_nav", "期末净值"),
         ("cagr", "年化收益"),
         ("max_drawdown", "最大回撤"),

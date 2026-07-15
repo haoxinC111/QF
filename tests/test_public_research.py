@@ -29,6 +29,8 @@ from ashare_quant.public_research import (
     PublicStrategyConfig,
     _SinaDecoder,
     _SinaPayload,
+    _annualized_period_turnover,
+    _audit_public_data_quality,
     _build_features,
     _build_sina_bars,
     _calculate_metrics,
@@ -429,6 +431,14 @@ class PublicResearchTests(unittest.TestCase):
         self.assertAlmostEqual(float(metrics["cagr"]), 0.10, places=2)
         self.assertAlmostEqual(float(metrics["max_drawdown"]), -0.20, places=12)
 
+    def test_empty_public_rebalances_have_zero_turnover(self) -> None:
+        self.assertEqual(
+            _annualized_period_turnover(
+                pd.DataFrame(), "2020-01-01", "2021-12-31"
+            ),
+            0.0,
+        )
+
     def test_public_config_rejects_infeasible_stock_cap(self) -> None:
         with self.assertRaises(ValueError):
             PublicStrategyConfig(top_n=10, max_stock_weight=0.05).validate()
@@ -436,6 +446,59 @@ class PublicResearchTests(unittest.TestCase):
     def test_public_config_rejects_negative_factor_weight(self) -> None:
         with self.assertRaisesRegex(ValueError, "非负有限数"):
             PublicStrategyConfig(weight_fip_momentum=-0.01).validate()
+
+    def test_public_config_rejects_invalid_coverage_threshold(self) -> None:
+        with self.assertRaisesRegex(ValueError, "minimum_month_end_quote_coverage"):
+            PublicStrategyConfig(minimum_month_end_quote_coverage=0.0).validate()
+
+    def test_public_data_quality_lists_missing_members_and_months(self) -> None:
+        signal_date = pd.Timestamp("2020-01-31")
+        membership = pd.DataFrame(
+            [
+                {
+                    "symbol": "SH600000",
+                    "name": "有行情",
+                    "opt-in": pd.Timestamp("2020-01-01"),
+                    "opt-out": pd.NaT,
+                },
+                {
+                    "symbol": "SH600001",
+                    "name": "无行情",
+                    "opt-in": pd.Timestamp("2020-01-01"),
+                    "opt-out": pd.NaT,
+                },
+            ]
+        )
+        bars = pd.DataFrame(
+            {
+                "symbol": ["SH600000"],
+                "date": [signal_date],
+            }
+        )
+        exact = pd.DataFrame({"symbol": ["SH600000"]})
+        quality = _audit_public_data_quality(
+            membership=membership,
+            relevant_symbols=["SH600000", "SH600001"],
+            bars=bars,
+            signal_dates=[signal_date],
+            exact_by_date={signal_date: exact},
+            config=PublicStrategyConfig(),
+            cache_manifest={"source": "unit-test"},
+            missing_execution_events=1,
+            missing_execution_symbols=["SH600001"],
+            stale_marks=2,
+        )
+        self.assertEqual(quality["data_quality_status"], "warning")
+        self.assertEqual(quality["members_without_any_bars"], ["SH600001"])
+        self.assertEqual(
+            quality["month_end_quote_coverage_below_threshold"][0][
+                "missing_symbols"
+            ],
+            ["SH600001"],
+        )
+        self.assertEqual(
+            quality["missing_execution_symbol_list"], ["SH600001"]
+        )
 
     def test_suspended_position_is_never_scaled_to_fund_buys(self) -> None:
         config = PublicStrategyConfig()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -7,7 +8,24 @@ from typing import Any, Mapping
 
 import yaml
 
-from .alpha import QUALITY_MOMENTUM_V1_5_WEIGHTS
+from .alpha import (
+    DEFAULT_ALPHA_PROFILE,
+    LEGACY_V1_4_WEIGHTS,
+    alpha_profile_weights,
+    identify_alpha_profile,
+)
+
+
+_FACTOR_CONFIG_FIELDS = {
+    "mom_12_1": "momentum_12_1_weight",
+    "mom_6_1": "momentum_6_1_weight",
+    "fip_momentum": "fip_momentum_weight",
+    "trend": "trend_weight",
+    "low_vol": "low_volatility_weight",
+    "low_downside_vol": "low_downside_volatility_weight",
+    "drawdown_quality": "drawdown_quality_weight",
+    "liquidity": "liquidity_weight",
+}
 
 
 def _date_text(value: Any) -> str:
@@ -55,18 +73,18 @@ class StrategyConfig:
     min_price: float = 3.0
     winsor_quantile: float = 0.05
     stock_trend_filter: bool = True
-    momentum_12_1_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["mom_12_1"]
-    momentum_6_1_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["mom_6_1"]
-    fip_momentum_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["fip_momentum"]
-    trend_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["trend"]
-    low_volatility_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["low_vol"]
-    low_downside_volatility_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS[
+    momentum_12_1_weight: float = LEGACY_V1_4_WEIGHTS["mom_12_1"]
+    momentum_6_1_weight: float = LEGACY_V1_4_WEIGHTS["mom_6_1"]
+    fip_momentum_weight: float = LEGACY_V1_4_WEIGHTS["fip_momentum"]
+    trend_weight: float = LEGACY_V1_4_WEIGHTS["trend"]
+    low_volatility_weight: float = LEGACY_V1_4_WEIGHTS["low_vol"]
+    low_downside_volatility_weight: float = LEGACY_V1_4_WEIGHTS[
         "low_downside_vol"
     ]
-    drawdown_quality_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS[
+    drawdown_quality_weight: float = LEGACY_V1_4_WEIGHTS[
         "drawdown_quality"
     ]
-    liquidity_weight: float = QUALITY_MOMENTUM_V1_5_WEIGHTS["liquidity"]
+    liquidity_weight: float = LEGACY_V1_4_WEIGHTS["liquidity"]
     volatility_lookback: int = 60
     benchmark_ma_days: int = 200
     risk_on_exposure: float = 0.95
@@ -81,6 +99,14 @@ class StrategyConfig:
     require_size_data: bool = True
     size_neutralization_enabled: bool = True
     size_neutralization_strength: float = 1.0
+    alpha_profile: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "alpha_profile",
+            identify_alpha_profile(self.factor_weights),
+        )
 
     @property
     def factor_weights(self) -> dict[str, float]:
@@ -180,6 +206,35 @@ class AppConfig:
             if fee_values is not None
             else _default_fee_schedule()
         )
+        strategy_values = dict(raw.get("strategy", {}))
+        declared_alpha_profile = strategy_values.pop("alpha_profile", None)
+        if declared_alpha_profile is None and any(
+            field_name in strategy_values
+            for field_name in _FACTOR_CONFIG_FIELDS.values()
+        ):
+            merged_weights = {
+                factor: float(
+                    strategy_values.get(field_name, LEGACY_V1_4_WEIGHTS[factor])
+                )
+                for factor, field_name in _FACTOR_CONFIG_FIELDS.items()
+            }
+            requested_alpha_profile = identify_alpha_profile(merged_weights)
+        else:
+            requested_alpha_profile = str(
+                declared_alpha_profile or DEFAULT_ALPHA_PROFILE
+            )
+        if requested_alpha_profile != "custom":
+            profile_weights = alpha_profile_weights(requested_alpha_profile)
+            for factor, value in profile_weights.items():
+                field_name = _FACTOR_CONFIG_FIELDS[factor]
+                if field_name in strategy_values and not math.isclose(
+                    float(strategy_values[field_name]), float(value), abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        f"alpha_profile={requested_alpha_profile} 与 {field_name} 冲突；"
+                        "自定义权重请设置 alpha_profile=custom"
+                    )
+                strategy_values[field_name] = float(value)
         config = cls(
             data=DataConfig(**dict(raw.get("data", {}))),
             backtest=BacktestConfig(
@@ -192,7 +247,7 @@ class AppConfig:
                     },
                 }
             ),
-            strategy=StrategyConfig(**dict(raw.get("strategy", {}))),
+            strategy=StrategyConfig(**strategy_values),
             execution=ExecutionConfig(**execution_values, fee_schedule=fee_schedule),
         )
         config.validate()

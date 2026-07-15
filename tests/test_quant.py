@@ -14,6 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from ashare_quant.backtest import Backtester, Lot, Position
+from ashare_quant.alpha import (
+    ALPHA_MODEL_VERSION,
+    DEFAULT_ALPHA_PROFILE,
+    LEGACY_V1_4_WEIGHTS,
+    alpha_profile_governance,
+)
 from ashare_quant.config import AppConfig
 from ashare_quant.data import (
     ACTION_COLUMNS,
@@ -37,6 +43,7 @@ from ashare_quant.research import (
     run_cost_stress,
     run_factor_ablation,
     run_rolling_oos,
+    write_research_suite,
 )
 from ashare_quant.provenance import (
     build_reproducibility_manifest,
@@ -68,6 +75,58 @@ def research_config(end_date: str = "2019-12-31") -> AppConfig:
 
 
 class AllocationAndConfigTests(unittest.TestCase):
+    def test_default_alpha_profile_is_promoted_legacy(self) -> None:
+        strategy = AppConfig().strategy
+        self.assertEqual(strategy.alpha_profile, DEFAULT_ALPHA_PROFILE)
+        self.assertEqual(strategy.factor_weights, dict(LEGACY_V1_4_WEIGHTS))
+        governance = alpha_profile_governance(strategy.alpha_profile)
+        self.assertEqual(governance["lifecycle_status"], "promoted")
+        self.assertEqual(governance["promotion_decision"], "promoted")
+
+    def test_yaml_can_explicitly_select_experimental_alpha(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "strategy:\n  alpha_profile: quality_momentum_v1_5\n",
+                encoding="utf-8",
+            )
+            strategy = AppConfig.from_yaml(path).strategy
+        self.assertEqual(strategy.alpha_profile, ALPHA_MODEL_VERSION)
+        self.assertEqual(
+            alpha_profile_governance(strategy.alpha_profile)["promotion_decision"],
+            "rejected",
+        )
+
+    def test_named_alpha_profile_rejects_conflicting_weights(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "strategy:\n"
+                "  alpha_profile: legacy_v1_4\n"
+                "  momentum_12_1_weight: 0.99\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "alpha_profile=.*冲突"):
+                AppConfig.from_yaml(path)
+
+    def test_legacy_v1_5_yaml_without_profile_is_inferred(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "strategy:\n"
+                "  momentum_12_1_weight: 0.25\n"
+                "  momentum_6_1_weight: 0.15\n"
+                "  fip_momentum_weight: 0.25\n"
+                "  trend_weight: 0.10\n"
+                "  low_volatility_weight: 0.00\n"
+                "  low_downside_volatility_weight: 0.15\n"
+                "  drawdown_quality_weight: 0.10\n"
+                "  liquidity_weight: 0.00\n",
+                encoding="utf-8",
+            )
+            strategy = AppConfig.from_yaml(path).strategy
+        self.assertEqual(strategy.alpha_profile, ALPHA_MODEL_VERSION)
+
     def test_cap_and_total_are_respected(self) -> None:
         raw = pd.Series([10.0, 3.0, 1.0, 0.5], index=list("ABCD"))
         result = _capped_allocation(raw, total=0.60, cap=0.20)
@@ -537,24 +596,26 @@ class EndToEndTests(unittest.TestCase):
 
     def test_matched_benchmark_metrics_are_reported(self) -> None:
         metrics = calculate_metrics(self.result, self.config)
-        self.assertEqual(metrics["alpha_profile"], "quality_momentum_v1_5")
+        self.assertEqual(metrics["alpha_profile"], "legacy_v1_4")
+        self.assertEqual(metrics["alpha_profile_status"], "promoted")
+        self.assertEqual(metrics["alpha_promotion_decision"], "promoted")
         self.assertIn("matched_benchmark_cagr", metrics)
         self.assertIn("benchmark_max_drawdown", metrics)
         self.assertIsNotNone(metrics["matched_benchmark_cagr"])
 
     def test_deterministic_golden_metrics(self) -> None:
         metrics = calculate_metrics(self.result, self.config)
-        self.assertAlmostEqual(float(metrics["final_nav"]), 856614.0873811552, places=4)
-        self.assertAlmostEqual(float(metrics["cagr"]), 0.03362532524814421, places=10)
+        self.assertAlmostEqual(float(metrics["final_nav"]), 870961.5596035972, places=4)
+        self.assertAlmostEqual(float(metrics["cagr"]), 0.04196309744833271, places=10)
         self.assertAlmostEqual(
-            float(metrics["max_drawdown"]), -0.08648768376745919, places=10
+            float(metrics["max_drawdown"]), -0.0908917222450416, places=10
         )
-        self.assertAlmostEqual(float(metrics["sharpe"]), 0.40551349043269524, places=10)
+        self.assertAlmostEqual(float(metrics["sharpe"]), 0.4919462883545638, places=10)
         self.assertAlmostEqual(
-            float(metrics["annual_turnover"]), 1.9057423119675363, places=10
+            float(metrics["annual_turnover"]), 1.9195314006881268, places=10
         )
-        self.assertAlmostEqual(float(metrics["total_fees"]), 5549.0402470266345, places=4)
-        self.assertEqual(int(metrics["filled_trade_count"]), 283)
+        self.assertAlmostEqual(float(metrics["total_fees"]), 5630.1728582604455, places=4)
+        self.assertEqual(int(metrics["filled_trade_count"]), 280)
 
     def test_exposure_tables_are_reported(self) -> None:
         industries = industry_exposure_table(self.result.selections)
@@ -601,6 +662,29 @@ class ResearchSuiteTests(unittest.TestCase):
             parsed["quality_momentum_v1_5"]["fip_momentum"],
             0.25,
         )
+
+    def test_research_suite_seals_relative_output_with_governance(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            relative_output = Path(directory).relative_to(ROOT)
+            written = write_research_suite(
+                self.bundle,
+                self.config,
+                relative_output,
+                modes=("alpha",),
+            )
+            self.assertTrue(all(path.is_absolute() for path in written.values()))
+            manifest = json.loads(written["manifest"].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["default_alpha_profile"], "legacy_v1_4")
+            self.assertEqual(
+                manifest["alpha_profile_governance"][
+                    "quality_momentum_v1_5"
+                ]["promotion_decision"],
+                "rejected",
+            )
+            verification = verify_artifact_manifest(
+                written["artifacts"], strict=True
+            )
+            self.assertTrue(verification["verified"])
 
     def test_cost_stress_records_assumptions(self) -> None:
         result = run_cost_stress(
