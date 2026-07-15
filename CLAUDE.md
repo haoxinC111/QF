@@ -131,7 +131,15 @@ python -m unittest discover tests
 
 ## 9. 已知问题（v1.4 本地复现后发现）
 
-- `uv.lock` 使用 PyPI 源生成。若本地默认 mirror 不是 PyPI（如 `UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple`），使用 `uv sync --locked --extra public --default-index https://pypi.org/simple`。不要用已弃用的 `UV_INDEX_URL` 覆盖，也不要为了同步而去掉 `--locked`。
+- `uv.lock` 必须使用 PyPI 源生成。若本地默认 mirror 不是 PyPI（如 `UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple`），生成/更新 lockfile 时应先取消该环境变量：
+  ```bash
+  env -u UV_DEFAULT_INDEX uv lock --upgrade
+  ```
+  同步时使用：
+  ```bash
+  uv sync --locked --extra public --default-index https://pypi.org/simple
+  ```
+  不要用已弃用的 `UV_INDEX_URL` 覆盖，也不要为了同步而去掉 `--locked`。
 - v1.4.0 压缩包里的 `results/public_research/` 是旧构建产物；v1.4.1 已停止追踪整个 `results/`。本地新结果只能作为绑定完整数据指纹的参考结果，源码包和 GitHub tag 不再携带生成结果。
 - issue #1（mini-racer 并发初始化 SIGTRAP）在 v1.4.2 改为单解码线程：worker 不再初始化或调用 V8；现代运行时使用 context manager，兼容实现存在 `close()` 时显式关闭。Linux/macOS CI 运行 6-worker 子进程压力测试；若真实下载仍出现原生崩溃，再升级为独立解码子进程。
 
