@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   test:
-    name: Python 3.12 / ${{ matrix.os }}
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -18,6 +18,9 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
+        python-version:
+          - "3.10"
+          - "3.12"
     env:
       MPLBACKEND: Agg
       PYTHONFAULTHANDLER: "1"
@@ -33,10 +36,13 @@ jobs:
           enable-cache: true
 
       - name: Install Python
-        run: uv python install 3.12
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Sync locked public environment
         run: uv sync --locked --extra public --default-index https://pypi.org/simple
+
+      - name: Lint with ruff
+        run: uv run --no-sync ruff check src tests
 
       - name: Run unit and subprocess tests
         run: uv run --no-sync python -m unittest discover -s tests -v
