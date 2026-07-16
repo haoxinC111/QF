@@ -109,7 +109,7 @@ def _make_research_fixture(
     }
     pit_manifest = {
         "schema_version": 1,
-        "provider": "synthetic",
+        "provider": "synthetic_demo",
         "data_fingerprint_sha256": "pit-fingerprint-alpha2",
         "base_data_fingerprint_sha256": "base-fingerprint-alpha2",
     }

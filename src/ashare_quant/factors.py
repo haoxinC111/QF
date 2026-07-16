@@ -193,6 +193,57 @@ class MultiFactorStrategy:
         )
         return selected
 
+    def _apply_research_score_overlay(
+        self,
+        candidates: pd.DataFrame,
+        signal_date: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Extension point for explicitly constructed research-only strategies.
+
+        The production strategy deliberately returns the input unchanged.  V2
+        shadow strategies override this hook instead of adding PIT fields to
+        ``StrategyConfig`` and accidentally making them selectable as a
+        production default.
+        """
+        del signal_date
+        return candidates
+
+    def _research_selection_columns(self) -> list[str]:
+        """Additional auditable columns emitted by research-only subclasses."""
+        return []
+
+    def _empty_plan(
+        self,
+        *,
+        signal_date: pd.Timestamp,
+        regime: str,
+        liquidity: dict[str, float],
+        volatility: dict[str, float],
+        status: str = "empty_universe",
+    ) -> SignalPlan:
+        empty = pd.DataFrame(
+            columns=[
+                "signal_date",
+                "symbol",
+                "rank",
+                "score",
+                "target_weight",
+                "regime",
+            ]
+        )
+        return SignalPlan(
+            signal_date=signal_date,
+            weights={},
+            selection=empty,
+            regime=regime,
+            target_exposure=0.0,
+            liquidity=liquidity,
+            reference_prices={},
+            volatility=volatility,
+            portfolio_model=self.portfolio_config.construction_model,
+            portfolio_status=status,
+        )
+
     def generate(
         self,
         signal_date: pd.Timestamp | str,
@@ -240,27 +291,11 @@ class MultiFactorStrategy:
 
         regime, requested_exposure = self._regime_at(signal_date)
         if candidates.empty:
-            empty = pd.DataFrame(
-                columns=[
-                    "signal_date",
-                    "symbol",
-                    "rank",
-                    "score",
-                    "target_weight",
-                    "regime",
-                ]
-            )
-            return SignalPlan(
+            return self._empty_plan(
                 signal_date=signal_date,
-                weights={},
-                selection=empty,
                 regime=regime,
-                target_exposure=0.0,
                 liquidity=liquidity,
-                reference_prices={},
                 volatility=volatility,
-                portfolio_model=self.portfolio_config.construction_model,
-                portfolio_status="empty_universe",
             )
 
         factor_inputs = {
@@ -283,6 +318,17 @@ class MultiFactorStrategy:
             )
             candidates["score_pre_neutral"] += (
                 candidates[z_column] * weights[factor] / weight_sum
+            )
+        candidates = self._apply_research_score_overlay(
+            candidates, signal_date
+        )
+        if candidates.empty:
+            return self._empty_plan(
+                signal_date=signal_date,
+                regime=regime,
+                liquidity=liquidity,
+                volatility=volatility,
+                status="empty_research_overlay",
             )
         candidates["z_size"] = _winsorized_zscore(
             candidates["log_total_mv"], self.config.winsor_quantile
@@ -389,6 +435,9 @@ class MultiFactorStrategy:
             "z_drawdown_quality",
             "z_liquidity",
         ]
+        for column in self._research_selection_columns():
+            if column in selected and column not in output_columns:
+                output_columns.append(column)
         return SignalPlan(
             signal_date=signal_date,
             weights=target_weights,

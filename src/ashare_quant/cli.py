@@ -22,6 +22,7 @@ from .pit_data import (
     verify_pit_cache,
 )
 from .pit_research import write_pit_factor_research
+from .pit_shadow import write_pit_shadow_research
 from .report import console_summary, write_report
 from .research import write_research_suite
 from .provenance import (
@@ -117,6 +118,29 @@ def _parser() -> argparse.ArgumentParser:
     )
     pit_research.add_argument("--train-years", type=int, default=5)
     pit_research.add_argument("--test-years", type=int, default=1)
+
+    pit_shadow = subparsers.add_parser(
+        "pit-shadow",
+        help="运行 V2 Alpha3 PIT 候选的严格账本四臂影子归因",
+    )
+    pit_shadow.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+    pit_shadow.add_argument(
+        "--alpha2-research",
+        default="results/pit_factor_research_v2_alpha2",
+        help="已严格封存且绑定相同数据指纹的 Alpha2 研究目录",
+    )
+    pit_shadow.add_argument(
+        "--output",
+        default="results/pit_shadow_v2_alpha3",
+        help="必须为空的 Alpha3 影子归因目录",
+    )
+    pit_shadow.add_argument(
+        "--cost-bps",
+        default="5,10,20",
+        help="逗号分隔的固定滑点压力；PIT 混合权重固定不寻优",
+    )
 
     research = subparsers.add_parser(
         "research", help="运行 Alpha、组合/成交归因、成本压力和滚动评估"
@@ -537,6 +561,30 @@ def _dispatch(args: argparse.Namespace) -> int:
             test_years=args.test_years,
         )
         print("PIT Alpha2 因子研究完成（生产策略未改变）:")
+        for name, path in written.items():
+            print(f"  {name}: {path}")
+        return 0
+    if args.command == "pit-shadow":
+        market = MarketDataBundle.from_cache(
+            config.data.cache_dir,
+            strict=config.data.strict_validation,
+            expected_config=config,
+        )
+        pit_bundle = _pit_bundle(config)
+        costs = [
+            float(value.strip())
+            for value in args.cost_bps.split(",")
+            if value.strip()
+        ]
+        written = write_pit_shadow_research(
+            market,
+            pit_bundle,
+            config,
+            args.output,
+            alpha2_research_dir=args.alpha2_research,
+            cost_bps=costs,
+        )
+        print("PIT Alpha3 严格账本影子归因完成（生产策略未改变）:")
         for name, path in written.items():
             print(f"  {name}: {path}")
         return 0

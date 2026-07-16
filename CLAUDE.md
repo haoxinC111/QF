@@ -29,6 +29,7 @@
   - `v2.0.0a4`：新增 PIT 基本面/估值因子注册、覆盖/IC/分组/暴露、消融、成本与滚动研究；生产策略仍冻结
   - `v2.0.0a5`：锁定 `ruff` 开发依赖、补 Python 3.10 CI 矩阵；功能代码与 v2.0.0a4 一致
   - `v2.0.0a6`：将最低 Python 版本从 3.10 修正为 3.11，CI 矩阵改为 3.11/3.12；功能代码与 v2.0.0a5 一致
+  - `v2.0.0a7`：新增 PIT 固定候选的严格账本四臂影子归因、覆盖匹配控制、年度/成本治理和 Alpha2 封存前置门禁；生产策略不变
 
 ## 3. ZIP 处理标准流程
 
@@ -41,7 +42,7 @@
    ```
 2. **核对顶层结构**：有的版本把项目放在 `a_share_quant/` 子目录下，有的直接放在根目录。解压后先确认 `run.py` 和 `src/ashare_quant/` 的位置。
 3. **与当前代码做差异比较**：
-- 核心模块：`src/ashare_quant/{config,data,pit_data,pit_research,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
+- 核心模块：`src/ashare_quant/{config,data,pit_data,pit_research,pit_shadow,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
    - 配置：`config.example.yaml`、`pyproject.toml`、`requirements*.txt`
    - 文档：`README.md`、`V1.*_VALIDATION.md`、`PUBLIC_SOURCE_AUDIT.md`
    - 测试：`tests/`
@@ -81,6 +82,7 @@
 - v1.4 配置新增 `data.regime_index`；升级时必须确认它是价格指数，并与全收益 `benchmark_index` 分离。
 - v1.6 配置新增 `portfolio` 段和 `execution.market_impact_*`；生产默认必须保持 `inverse_vol_v1_4 + fixed_bps`，新模型只能显式启用并标记实验状态。
 - V2 配置结构为 `schema_version: 2`，新增 `point_in_time` 段且默认关闭；旧 YAML 可迁移，但 PIT 数据不能静默进入生产 Alpha。
+- V2 Alpha3 的 `pit-shadow` 只能消费严格封存且数据指纹一致的完整 Alpha2 研究包；固定 25% PIT 权重不可从 YAML 或 CLI 调参，结果最多进入前瞻模拟观察。
 
 ## 5. 何时必须提问或上报
 
@@ -129,6 +131,9 @@ python run.py validate-data --config config.yaml
 python run.py pit-download --config config.yaml
 python run.py pit-verify --config config.yaml
 python run.py pit-research --config config.yaml --output results/pit_factor_research_v2_alpha2
+python run.py result-verify --output results/pit_factor_research_v2_alpha2 --strict
+python run.py pit-shadow --config config.yaml --alpha2-research results/pit_factor_research_v2_alpha2 --output results/pit_shadow_v2_alpha3
+python run.py result-verify --output results/pit_shadow_v2_alpha3 --strict
 
 # 公开通道下载
 python run.py public-download --membership csi300.csv --cache data/public_eastmoney --source sina

@@ -245,6 +245,46 @@ def compute_pit_factor_values(
     return values
 
 
+def compute_pit_composite_scores(
+    snapshot: pd.DataFrame,
+    factor_names: Iterable[str] | None = None,
+    *,
+    minimum_factors_per_symbol: int = 4,
+    winsor_quantile: float = 0.05,
+) -> pd.DataFrame:
+    """Return the fixed Alpha2 composite without any future-return columns.
+
+    This is the only PIT score surface consumed by the Alpha3 shadow strategy.
+    Keeping it separate from ``build_pit_factor_panel`` makes it structurally
+    impossible for forward labels to enter the strict execution path.
+    """
+    names = resolve_pit_factor_names(factor_names)
+    if "symbol" not in snapshot:
+        raise ValueError("PIT 因子截面缺少 symbol")
+    if snapshot["symbol"].astype(str).duplicated().any():
+        raise ValueError("PIT 因子截面包含重复证券")
+    if not 1 <= minimum_factors_per_symbol <= len(names):
+        raise ValueError("minimum_factors_per_symbol 超出所选因子数量")
+    if not 0 <= winsor_quantile < 0.5:
+        raise ValueError("winsor_quantile 必须在 [0, 0.5) 内")
+
+    result = compute_pit_factor_values(snapshot, names).copy()
+    for name in names:
+        result[f"z_{name}"] = _cross_sectional_zscore(
+            result[name], winsor_quantile
+        )
+    z_columns = [f"z_{name}" for name in names]
+    result["available_factor_count"] = result[z_columns].notna().sum(axis=1)
+    composite = result[z_columns].mean(axis=1, skipna=True).where(
+        result["available_factor_count"].ge(minimum_factors_per_symbol)
+    )
+    result[PIT_COMPOSITE_NAME] = composite
+    result[f"z_{PIT_COMPOSITE_NAME}"] = _cross_sectional_zscore(
+        composite, winsor_quantile
+    )
+    return result
+
+
 def _cross_sectional_zscore(
     values: pd.Series,
     winsor_quantile: float,

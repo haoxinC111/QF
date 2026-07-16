@@ -99,14 +99,18 @@ class BacktestResult:
 
 
 class Backtester:
-    def __init__(self, bundle: MarketDataBundle, config: AppConfig) -> None:
+    def __init__(
+        self,
+        bundle: MarketDataBundle,
+        config: AppConfig,
+        *,
+        strategy: MultiFactorStrategy | None = None,
+    ) -> None:
         config.validate()
         self.bundle = bundle.prepare(strict=config.data.strict_validation)
         self.config = config
-        self.strategy = MultiFactorStrategy(
-            self.bundle,
-            config.strategy,
-            config.portfolio,
+        self.strategy = strategy or MultiFactorStrategy(
+            self.bundle, config.strategy, config.portfolio
         )
         self.cash = float(config.backtest.initial_cash)
         self.positions: dict[str, Position] = {}
