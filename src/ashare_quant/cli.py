@@ -21,6 +21,7 @@ from .pit_data import (
     TusharePointInTimeDownloader,
     verify_pit_cache,
 )
+from .pit_research import write_pit_factor_research
 from .report import console_summary, write_report
 from .research import write_research_suite
 from .provenance import (
@@ -83,6 +84,39 @@ def _parser() -> argparse.ArgumentParser:
     pit_snapshot.add_argument(
         "--force", action="store_true", help="允许覆盖既有快照及其元数据"
     )
+
+    pit_research = subparsers.add_parser(
+        "pit-research",
+        help="运行 V2 Alpha2 基本面/估值因子覆盖、IC、分组与滚动研究",
+    )
+    pit_research.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+    pit_research.add_argument(
+        "--output",
+        default="results/pit_factor_research_v2_alpha2",
+        help="必须为空的研究结果目录",
+    )
+    pit_research.add_argument(
+        "--factors",
+        default="all",
+        help="逗号分隔的 PIT 因子名，默认 all",
+    )
+    pit_research.add_argument(
+        "--horizons", default="21,63", help="逗号分隔的前瞻交易日数"
+    )
+    pit_research.add_argument("--quantiles", type=int, default=5)
+    pit_research.add_argument(
+        "--minimum-factors-per-symbol", type=int, default=4
+    )
+    pit_research.add_argument(
+        "--minimum-ic-observations", type=int, default=20
+    )
+    pit_research.add_argument(
+        "--cost-bps", default="5,10,20", help="逗号分隔的单边成本压力"
+    )
+    pit_research.add_argument("--train-years", type=int, default=5)
+    pit_research.add_argument("--test-years", type=int, default=1)
 
     research = subparsers.add_parser(
         "research", help="运行 Alpha、组合/成交归因、成本压力和滚动评估"
@@ -467,6 +501,44 @@ def _dispatch(args: argparse.Namespace) -> int:
         else:
             print(snapshot.head(20).to_string(index=False))
             print(f"PIT 快照: {len(snapshot)} 行（终端最多显示 20 行）")
+        return 0
+    if args.command == "pit-research":
+        market = MarketDataBundle.from_cache(
+            config.data.cache_dir,
+            strict=config.data.strict_validation,
+            expected_config=config,
+        )
+        pit_bundle = _pit_bundle(config)
+        factors = [
+            value.strip() for value in args.factors.split(",") if value.strip()
+        ]
+        horizons = [
+            int(value.strip())
+            for value in args.horizons.split(",")
+            if value.strip()
+        ]
+        costs = [
+            float(value.strip())
+            for value in args.cost_bps.split(",")
+            if value.strip()
+        ]
+        written = write_pit_factor_research(
+            market,
+            pit_bundle,
+            config,
+            args.output,
+            factor_names=factors,
+            horizons=horizons,
+            quantiles=args.quantiles,
+            minimum_factors_per_symbol=args.minimum_factors_per_symbol,
+            minimum_ic_observations=args.minimum_ic_observations,
+            cost_bps=costs,
+            train_years=args.train_years,
+            test_years=args.test_years,
+        )
+        print("PIT Alpha2 因子研究完成（生产策略未改变）:")
+        for name, path in written.items():
+            print(f"  {name}: {path}")
         return 0
     if args.command == "download":
         bundle = TushareDownloader(config).download()

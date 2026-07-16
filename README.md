@@ -1,6 +1,6 @@
 # A股动态股票池多因子量化回测
 
-这是一个研究/回测级的 Python 项目。v1.5.1 根据真实公开历史回放把生产 Alpha 默认恢复为 `legacy_v1_4`；v1.6 在保持该 Alpha 与入选证券不变的前提下，新增可审计的收缩协方差组合模型和平方根市场冲击模型。V2.0 Alpha 1 又新增独立的 Point-in-Time 财报/估值侧车、公告可见性规则和不可变快照，但尚未把这些数据接入生产 Alpha。所有 V2 能力默认关闭，v1.6 生产路径与结果保持不变。严格通道继续建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、部分成交、滑点和成交容量。
+这是一个研究/回测级的 Python 项目。v1.5.1 根据真实公开历史回放把生产 Alpha 默认恢复为 `legacy_v1_4`；v1.6 在保持该 Alpha 与入选证券不变的前提下，新增可审计的收缩协方差组合模型和平方根市场冲击模型。V2.0 Alpha 1 新增独立的 Point-in-Time 财报/估值侧车，Alpha 2 又新增固定因子注册、覆盖/IC/分组/暴露、消融、成本与滚动研究，但仍未把这些数据接入生产 Alpha。所有 V2 能力默认关闭，v1.6 生产路径与结果保持不变。严格通道继续建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、部分成交、滑点和成交容量。
 
 > 重要：本项目不构成投资建议，不承诺收益，也没有连接券商下单。先用离线演示确认环境，再用自己的数据权限回测；任何真实资金使用前，都应做样本外检验、压力测试、人工复核和小资金仿真。
 
@@ -61,6 +61,12 @@ v1.5 实验候选的公式、冻结权重和原始协议详见 [`V1.5_ALPHA.md`]
 `2.0.0a1` 把财报和日终估值放在独立 `data/pit_cache/` 侧车中，并通过基础行情 manifest 的 SHA256 与数据指纹绑定。财报默认在公告后的下一交易日可见；修订只从其自身可用日开始替换旧版本。读取时重新计算可用日并核对全部分区 SHA256，未来记录扰动不能改变过去快照。
 
 该模块目前只支持下载、校验和导出研究快照，不参与默认选股或权重计算。因此它是后续基本面 Alpha 研究的可信输入层，不是收益提升声明。完整数据契约、命令和验收边界见 [`V2.0_ALPHA1_PIT_DATA.md`](V2.0_ALPHA1_PIT_DATA.md)。
+
+### V2.0 第二阶段：基本面/估值因子研究
+
+`2.0.0a4` 在 PIT 侧车上注册 11 个固定盈利、质量、成长和估值因子，以及一个不拟合权重的等权研究组合。`pit-research` 按月末历史成分生成研究面板，输出逐日覆盖率、21/63 日 IC、分组收益、行业/市值暴露、逐因子消融、成本压力和扩展窗滚动验证。
+
+候选 `fundamental_value_composite_v2_alpha2` 的生产权重固定为 0；治理程序即使全部通过也只允许进入人工候选复核，不会修改 `MultiFactorStrategy`。公式、输出和真实数据验收边界见 [`V2.0_ALPHA2_FACTOR_RESEARCH.md`](V2.0_ALPHA2_FACTOR_RESEARCH.md)。
 
 ## 二、回测中建模的 A 股约束
 
@@ -283,9 +289,11 @@ python run.py pit-download --config config.yaml
 python run.py pit-verify --config config.yaml
 python run.py pit-snapshot --config config.yaml --date 2020-04-01 \
   --output results/pit_snapshot_2020-04-01.csv
+python run.py pit-research --config config.yaml \
+  --output results/pit_factor_research_v2_alpha2
 ```
 
-快照会同时生成包含文件 SHA256、PIT 数据指纹和基础行情指纹的 `.manifest.json`。这不会自动让财报数据进入生产策略。
+快照会同时生成包含文件 SHA256、PIT 数据指纹和基础行情指纹的 `.manifest.json`。Alpha 2 研究目录同时封存基础行情和 PIT 两份数据身份；两条命令都不会自动让财报数据进入生产策略。
 
 v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manifest.json` 保存所有实际输入文件的大小和 SHA256。旧 v3 缓存不能静默复用；首次升级必须把 `data.refresh` 改为 `true` 运行一次 `download`，完成后再改回 `false`。
 
@@ -325,6 +333,8 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 | `reproducibility.json` | 研究配置、代码和数据的完整可复现身份 |
 | `experiment_registry.jsonl` | 固定参数研究协议和实验身份登记 |
 | `artifact_manifest.json` | 研究输出的逐文件 SHA256 和集合指纹 |
+
+`pit-research` 默认在 `results/pit_factor_research_v2_alpha2/` 生成 PIT 因子面板、覆盖率、IC、分组收益、行业/市值暴露、消融、滚动验证、成本压力、治理决定、双数据指纹和产物 SHA256。输出目录必须为空；完整文件表见 [`V2.0_ALPHA2_FACTOR_RESEARCH.md`](V2.0_ALPHA2_FACTOR_RESEARCH.md)。
 
 `public-research` 命令默认在 `results/public_research/` 生成：
 
@@ -375,6 +385,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 - `valuation_lag_trading_days`：日终估值的可见性滞后；收盘后信号可用 0，开盘前信号应使用 1。
 - `maximum_*_age_days`：导出快照时允许使用的最大数据年龄。
 - `minimum_symbol_coverage`：整个请求区间内的证券最低覆盖率；它不是逐截面覆盖率或 Alpha 有效性证明。
+- Alpha 2 研究参数通过 `pit-research` 命令显式传入，不会进入或改变生产 `strategy` 配置。
 
 ### 选股
 
@@ -428,7 +439,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 - 指数历史成分降低了幸存者偏差，但不能消除指数编制本身的选择偏差。
 - 分红送股已进入股份账本，但个人红利税与持有期相关，复杂税务仍需券商级清算数据。
 - 普通现金分红、送股和退市已处理；配股、换股吸收合并、破产重整等特殊事件仍需扩展。
-- 生产默认因子仍全部来自价格路径；V2.0 Alpha 1 虽已提供 PIT 财报/估值输入层，但还没有经过因子层 IC、分组、消融和滚动验证，也未进入生产选股。v1.6 协方差是长-only 收缩最小方差近似，不是完整 Barra 风险模型或精确二次规划器。
+- 生产默认因子仍全部来自价格路径；V2.0 Alpha 2 已提供 PIT 因子研究管线，但尚未取得本仓库绑定的真实全量 PIT 证据，也未进入生产选股。v1.6 协方差是长-only 收缩最小方差近似，不是完整 Barra 风险模型或精确二次规划器。
 - 申万行业成员和每日市值依赖数据源历史覆盖与修订；下载后的 v4 缓存与 `reproducibility.json` 必须和结果一起归档。
 - 行业/市值残差化是截面线性控制，不等于 Barra 类多因子风险模型，也不保证实际组合暴露严格为零。
 - 默认基准已切换为全收益指数，但实际数据源是否完整仍应通过 `validate-data` 确认。
@@ -438,13 +449,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 
 ## 八、测试
 
-无需 Tushare Token：
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-当前包含 110 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、数据/缓存完整性、未来数据隔离、冻结 Alpha 对照、排名缓冲、行业/单股约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、公司行动、研究封存，以及 v1.6 协方差分散/历史不足回退/防前视、换手平滑、冲击单调性/上限、组合可行性、容量部分成交与三日重试、低于整手容量拒单、订单审计、CLI 参数路由、严格/公开四臂归因、公开冲击成本账本和公开产物 SHA256 封存。V2 另覆盖公告/修订可见性、未来值扰动隔离、指标/单位契约、PIT 分区/证券身份与基础行情绑定、下载续传封存、确定性数据指纹、配置迁移、严格标量类型、版本锁一致性和快照 SHA256。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
+当前包含 118 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、数据/缓存完整性、未来数据隔离、冻结 Alpha 对照、排名缓冲、行业/单股约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、公司行动、研究封存，以及 v1.6 协方差分散/历史不足回退/防前视、换手平滑、冲击单调性/上限、组合可行性、容量部分成交与三日重试、低于整手容量拒单、订单审计、CLI 参数路由、严格/公开四臂归因、公开冲击成本账本和公开产物 SHA256 封存。V2 另覆盖公告/修订可见性、未来值扰动隔离、指标/单位契约、PIT 分区/证券身份与基础行情绑定、下载续传封存、确定性数据指纹、配置迁移、严格标量类型、版本锁一致性、快照 SHA256，以及 Alpha 2 因子方向、月末面板、防前视、IC/分组、暴露、成本账本、双数据指纹与研究产物封存。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
 
 ## 九、项目结构
 
@@ -461,6 +466,8 @@ a_share_quant/
 ├── V1.6_VALIDATION.md # 自动化验收、合成四臂结果和真实数据复核命令
 ├── V2.0_ALPHA1_PIT_DATA.md # PIT 财报/估值契约、可见性和使用方式
 ├── V2.0_ALPHA1_VALIDATION.md # 第一阶段自动化验收与 v1.6 回归
+├── V2.0_ALPHA2_FACTOR_RESEARCH.md # PIT 因子公式、研究协议、治理和使用方式
+├── V2.0_ALPHA2_VALIDATION.md # 第二阶段工程验收与真实数据复核命令
 ├── V1.4_TRUSTWORTHINESS.md
 ├── V1.2_VALIDATION.md  # 改造验收、合成对照和压力结果
 ├── src/ashare_quant/
@@ -470,6 +477,7 @@ a_share_quant/
 │   ├── config.py       # 配置与参数校验
 │   ├── data.py         # Tushare 下载、缓存、数据校验、离线演示
 │   ├── pit_data.py     # V2 PIT 财报/估值下载、封存、校验和快照
+│   ├── pit_research.py # V2 Alpha2 因子面板、诊断、治理与封存
 │   ├── factors.py      # 因子、动态成分、选股、风险开关与权重
 │   ├── portfolio.py    # 逆波动率基线、收缩协方差和换手平滑
 │   ├── execution.py    # 固定滑点/平方根冲击公式与模型治理
@@ -479,7 +487,8 @@ a_share_quant/
 └── tests/
     ├── test_quant.py
     ├── test_public_research.py
-    └── test_pit_data.py
+    ├── test_pit_data.py
+    └── test_pit_research.py
 ```
 
 ## 十、规则与数据接口参考

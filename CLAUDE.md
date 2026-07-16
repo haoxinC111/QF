@@ -26,6 +26,7 @@
   - `v1.5.1`：恢复 legacy 默认 Alpha，标记 v1.5 候选治理状态，补充公开数据逐月覆盖审计
   - `v1.6.0`：新增收缩协方差/换手平滑组合候选、平方根市场冲击、成交审计和四臂归因
   - `v2.0.0a1`：新增独立 PIT 财报/估值侧车、公告/修订可见性、缓存身份绑定和配置迁移；生产策略不变
+  - `v2.0.0a4`：新增 PIT 基本面/估值因子注册、覆盖/IC/分组/暴露、消融、成本与滚动研究；生产策略仍冻结
 
 ## 3. ZIP 处理标准流程
 
@@ -38,7 +39,7 @@
    ```
 2. **核对顶层结构**：有的版本把项目放在 `a_share_quant/` 子目录下，有的直接放在根目录。解压后先确认 `run.py` 和 `src/ashare_quant/` 的位置。
 3. **与当前代码做差异比较**：
-- 核心模块：`src/ashare_quant/{config,data,pit_data,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
+- 核心模块：`src/ashare_quant/{config,data,pit_data,pit_research,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
    - 配置：`config.example.yaml`、`pyproject.toml`、`requirements*.txt`
    - 文档：`README.md`、`V1.*_VALIDATION.md`、`PUBLIC_SOURCE_AUDIT.md`
    - 测试：`tests/`
@@ -125,6 +126,7 @@ python run.py validate-data --config config.yaml
 # V2 PIT 侧车下载与校验（需 point_in_time.enabled=true）
 python run.py pit-download --config config.yaml
 python run.py pit-verify --config config.yaml
+python run.py pit-research --config config.yaml --output results/pit_factor_research_v2_alpha2
 
 # 公开通道下载
 python run.py public-download --membership csi300.csv --cache data/public_eastmoney --source sina
