@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ashare-multifactor-backtest"
-version = "2.0.0a5"
+version = "2.0.0a6"
 description = "Point-in-time A-share multi-factor research and validation backtester"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26,<3",
   "pandas>=2.1,<3",

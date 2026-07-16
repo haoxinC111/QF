@@ -5,4 +5,4 @@ from .data import MarketDataBundle
 from .pit_data import PointInTimeDataBundle
 
 __all__ = ["AppConfig", "MarketDataBundle", "PointInTimeDataBundle"]
-__version__ = "2.0.0a5"
+__version__ = "2.0.0a6"
