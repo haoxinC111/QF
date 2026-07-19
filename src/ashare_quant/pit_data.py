@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 import logging
 import os
 from dataclasses import dataclass, field
@@ -219,6 +220,16 @@ def _read_symbol_partitions(
     if not frames:
         return pd.DataFrame(columns=list(columns))
     return pd.concat(frames, ignore_index=True)
+
+
+def require_pit_research_eligible(manifest: Mapping[str, Any]) -> None:
+    """Reject engineering fixtures while preserving legacy/direct PIT caches."""
+    if manifest.get("research_eligible") is False:
+        mode = manifest.get("archive_bridge", {}).get("mode", "fixture")
+        raise ValueError(
+            "PIT 缓存仅用于工程复现，不能生成 Alpha 证据: "
+            f"archive_bridge.mode={mode}"
+        )
 
 
 def _verify_base_market_cache(
@@ -998,6 +1009,41 @@ class PointInTimeDataBundle:
             for path in root.rglob("*")
             if path.is_file() and path != manifest_path
         }
+        archive_bridge = manifest.get("archive_bridge")
+        if archive_bridge is not None:
+            if not isinstance(archive_bridge, Mapping):
+                raise ValueError("PIT archive_bridge 必须是对象")
+            lineage_name = str(archive_bridge.get("lineage_file", ""))
+            if lineage_name != "archive_lineage.json.gz":
+                raise ValueError("PIT 归档桥接血缘文件名不受支持")
+            lineage_path = root / lineage_name
+            if not lineage_path.is_file():
+                raise FileNotFoundError(f"PIT 缺少归档血缘文件: {lineage_path}")
+            try:
+                with gzip.open(lineage_path, "rt", encoding="utf-8") as handle:
+                    lineage = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("PIT 归档血缘文件无效") from exc
+            if not isinstance(lineage, Mapping):
+                raise ValueError("PIT 归档血缘顶层必须是对象")
+            task_set_sha256 = payload_sha256(lineage.get("selected_tasks", []))
+            bridge_version = int(archive_bridge.get("schema_version", 0))
+            bridge_mode = str(archive_bridge.get("mode", ""))
+            acceptance_required = bridge_mode == "strict" and bridge_version >= 2
+            if (
+                task_set_sha256 != lineage.get("selected_task_set_sha256")
+                or task_set_sha256
+                != archive_bridge.get("selected_task_set_sha256")
+                or bool(lineage.get("research_eligible"))
+                != bool(manifest.get("research_eligible"))
+                or lineage.get("mode") != bridge_mode
+                or bool(manifest.get("research_eligible"))
+                != (bridge_mode == "strict")
+                or bool(archive_bridge.get("acceptance_required"))
+                != acceptance_required
+            ):
+                raise ValueError("PIT 归档血缘、模式、任务集合或研究资格不一致")
+            consumed.add(lineage_name)
         if recorded != consumed or actual != recorded:
             raise ValueError(
                 "PIT 缓存读取文件、封存文件与实际文件集合不一致；"
@@ -1102,7 +1148,12 @@ class PointInTimeDataBundle:
 def _clear_known_cache(root: Path) -> None:
     if not root.exists():
         return
-    allowed_names = {"manifest.json", "calendar.csv.gz", "download_state.json"}
+    allowed_names = {
+        "manifest.json",
+        "calendar.csv.gz",
+        "download_state.json",
+        "archive_lineage.json.gz",
+    }
     unexpected: list[str] = []
     files = [path for path in root.rglob("*") if path.is_file()]
     for path in files:
@@ -1279,7 +1330,7 @@ class TusharePointInTimeDownloader:
         )
         end = pd.Timestamp(self.config.backtest.end_date)
         symbols = sorted(market.membership["symbol"].astype(str).unique())
-        calendar = self._fetch_calendar(start, end + pd.Timedelta(days=14))
+        calendar = self._fetch_calendar(start, end + pd.Timedelta(14, unit="D"))
         state_path = self.root / "download_state.json"
         identity = {
             "schema_version": PIT_CACHE_SCHEMA_VERSION,
@@ -1531,6 +1582,7 @@ __all__ = [
     "availability_dates",
     "normalize_fundamental_source",
     "normalize_valuations",
+    "require_pit_research_eligible",
     "verify_pit_cache",
     "write_pit_cache",
 ]

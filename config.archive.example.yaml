@@ -1,0 +1,74 @@
+schema_version: 1
+
+provider:
+  kind: tushare_compatible_http
+  name: research_proxy_unverified
+  # 网关地址必须包含实际路径后缀（例如 /pro），不能只是域名根路径。
+  base_url_env: QF_ARCHIVE_API_URL
+  token_env: QF_ARCHIVE_API_TOKEN
+  # 部分网关要求额外的 API key 头（如 X-API-Key）。
+  # api_key_env: QF_ARCHIVE_API_KEY
+  # api_key_header: X-API-Key
+  forbid_token_env:
+    - TUSHARE_TOKEN
+  authorization_confirmed: false
+  local_archival_allowed: false
+  allowed_hosts: []
+  request:
+    accept_encoding: gzip
+    connect_timeout_seconds: 10
+    read_timeout_seconds: 120
+    follow_cross_host_redirects: false
+
+rate_limit:
+  calls_per_minute: 75
+  initial_workers: 1
+  maximum_workers: 2
+  promotion_after_successes: 1000
+  retry_attempts: 5
+  retry_statuses: [429, 500, 502, 503, 504]
+
+archive:
+  root: data_lake
+  raw_format: json.zst
+  table_format: parquet
+  parquet_compression: zstd
+  immutable_raw: true
+  save_all_fields: true
+  write_request_manifest: true
+  write_schema_fingerprint: true
+  checksum: sha256
+
+scope:
+  markets: [SSE, SZSE, BSE]
+  include_list_status: [L, D, P]
+  start: earliest
+  end: latest_complete_trade_date
+  priorities: [P0, P1]
+
+completeness:
+  row_cap_mode: probe_and_split
+  fail_on_suspected_truncation: true
+  fail_on_schema_drift: true
+  distinguish_empty_from_denied: true
+  random_refetch_partitions: 20
+  cross_source_sample_symbols: 100
+  cross_source_sample_dates: 20
+
+point_in_time:
+  enabled: true
+  financial_visibility: next_trading_day_after_announcement
+  retain_all_revisions: true
+  reject_current_membership_backfill: true
+
+batches:
+  - id: A_probe
+    enabled: true
+  - id: B_p0_core
+    enabled: false
+  - id: C_p1_unique
+    enabled: false
+  - id: D_large_tables
+    enabled: false
+  - id: E_final_freeze
+    enabled: false

@@ -1,3 +1,34 @@
+# QF-integration — 隔离开发目录规则（P0 下载期间优先生效）
+
+> 本目录是 P0 全量归档下载期间的**隔离开发副本**，快照自活动下载目录
+> `../a_share_quant/`（冻结提交 `5b4d054 p0-runtime-freeze`，对应其
+> `DOWNLOAD_RUN_IDENTITY.json`）。一切开发、测试、云端 ZIP 解包复现都在这里做。
+
+## 🔴 红线（违反可能搞挂下载或触发 API 风控）
+
+1. **禁止碰活动目录** `../a_share_quant/`：不修改、不删除、不在其中切分支、
+   不对它跑 `uv sync`/`pip install`。读取源码可以，写入一律不行。
+2. **禁止启动任何 P0 下载 worker**：不运行 `scripts/run_p0_batch.py`、
+   `scripts/run_b2_resume_chain.sh`、`scripts/run_all_p0_batches.sh`。
+   下载由活动目录的放生进程独占（单 API key 风控，双 worker 会被限流）。
+3. **禁止直连活动状态库** `../a_share_quant/data_lake/catalog/archive.duckdb`。
+   查状态用快照 `../QF-fixtures/catalog_snapshot.sqlite`
+   （只读 URI：`sqlite3.connect('file:...?mode=ro', uri=True)`；
+   它是 SQLite 引擎，扩展名是历史误命名。快照每 2h 由下载 agent 巡查刷新）。
+4. **禁止向 `<archive-gateway-host>` 发任何请求**（下载 key 的 API 域名）。
+   测试一律用 `../QF-fixtures/` 的样本数据或合成数据。
+5. 云端交付的 ZIP 只在本目录解包测试；**P0 全部批次 pass 之前**，
+   任何新代码不得回填活动目录。
+
+## 本目录环境
+
+- 独立 `.venv`（已 `uv sync --frozen`，editable 指向本目录 src）
+- 运行：`uv run --no-sync ...`；测试：`uv run --no-sync pytest`
+- 样本与状态快照：`../QF-fixtures/`
+- 批次链进度：B0/B1 ✅，B2 进行中，B3/B4 排队；进度查询归下载 agent 会话，不要自行巡查。
+
+---
+
 # A 股多因子量化回测项目 —— 本地管理规则
 
 > 本文件只记录**当前项目**的特殊管理规则。全局偏好（中文回复、`uv` 优先、主目录单线开发等）继续遵循 `~/.claude/CLAUDE.md`。
@@ -30,6 +61,8 @@
   - `v2.0.0a5`：锁定 `ruff` 开发依赖、补 Python 3.10 CI 矩阵；功能代码与 v2.0.0a4 一致
   - `v2.0.0a6`：将最低 Python 版本从 3.10 修正为 3.11，CI 矩阵改为 3.11/3.12；功能代码与 v2.0.0a5 一致
   - `v2.0.0a7`：新增 PIT 固定候选的严格账本四臂影子归因、覆盖匹配控制、年度/成本治理和 Alpha2 封存前置门禁；生产策略不变
+  - `v2.0.0a10`：新增 Bronze 归档到 PIT v1 的只读离线桥接、B0/B1/B3 批次门禁、Schema/行数/SHA256 复核、分桶流式转换和 fixture 禁研标志；生产策略不变
+  - `v2.0.0a11`：新增 Alpha5 真实 PIT 一键验收、源证据重放、逐月历史覆盖、数据指纹绑定回执与 Alpha2/Alpha3 强制门禁；批次决策增加 `no_quarantined`，并修复 macOS 临时目录比较和 NumPy/Pandas 时间差弃用告警；生产策略不变
 
 ## 3. ZIP 处理标准流程
 
@@ -42,7 +75,7 @@
    ```
 2. **核对顶层结构**：有的版本把项目放在 `a_share_quant/` 子目录下，有的直接放在根目录。解压后先确认 `run.py` 和 `src/ashare_quant/` 的位置。
 3. **与当前代码做差异比较**：
-- 核心模块：`src/ashare_quant/{config,data,pit_data,pit_research,pit_shadow,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
+- 核心模块：`src/ashare_quant/{config,data,pit_data,pit_research,pit_shadow,pit_lake,pit_acceptance,alpha,factors,portfolio,execution,backtest,report,cli,research,public_research,provenance}.py`
    - 配置：`config.example.yaml`、`pyproject.toml`、`requirements*.txt`
    - 文档：`README.md`、`V1.*_VALIDATION.md`、`PUBLIC_SOURCE_AUDIT.md`
    - 测试：`tests/`
@@ -70,6 +103,8 @@
 - 首次运行公开回测时需要联网下载行情缓存到 `data/public_eastmoney/`。
 - v1.4 的严格缓存为 v4，新增 `regime.csv.gz` 和逐文件 SHA256；旧 v3 缓存需要 `data.refresh: true` 重新生成。
 - V2 PIT 缓存是独立侧车，必须和 v4 基础行情 manifest 的 SHA256/数据指纹匹配；不得用 PIT 下载器覆盖基础行情缓存。
+- V2 Alpha4 严格缓存还必须绑定 B0/B1/B3 同快照 pass 证据、Bronze/Schema SHA256 和任务集合指纹。`--fixture-mode` 产物固定 `research_eligible=false`，不得运行 Alpha2/Alpha3。
+- V2 Alpha5 新 strict 缓存还必须通过 `pit-acceptance` 并向 Alpha2/Alpha3 提供与 PIT/任务集合指纹完全绑定的 `pass` 回执；fixture 回执固定为 `engineering_only`，任何 `quarantined` 任务都会阻断批次研究准入。
 - v1.3 公开缓存无需重下，先运行 `public-verify --seal-legacy` 生成指纹；此后校验失败不得自动覆盖或重新封存。
 
 ### 4.4 网络与环境
@@ -83,6 +118,8 @@
 - v1.6 配置新增 `portfolio` 段和 `execution.market_impact_*`；生产默认必须保持 `inverse_vol_v1_4 + fixed_bps`，新模型只能显式启用并标记实验状态。
 - V2 配置结构为 `schema_version: 2`，新增 `point_in_time` 段且默认关闭；旧 YAML 可迁移，但 PIT 数据不能静默进入生产 Alpha。
 - V2 Alpha3 的 `pit-shadow` 只能消费严格封存且数据指纹一致的完整 Alpha2 研究包；固定 25% PIT 权重不可从 YAML 或 CLI 调参，结果最多进入前瞻模拟观察。
+- V2 Alpha4 的 `pit-lake-build` 只读归档状态库且不访问网络；B3 未 pass 时禁止通过删门槛、伪造 decision 或把 Phase A 样例标成 strict 绕过。
+- V2 Alpha5 的 `pit-acceptance` 只读归档证据且不访问网络；严格验收失败时保留封存诊断并返回退出码 2，禁止复制其他缓存的回执或改写 `acceptance_required` 绕过。
 
 ## 5. 何时必须提问或上报
 
@@ -134,6 +171,10 @@ python run.py pit-research --config config.yaml --output results/pit_factor_rese
 python run.py result-verify --output results/pit_factor_research_v2_alpha2 --strict
 python run.py pit-shadow --config config.yaml --alpha2-research results/pit_factor_research_v2_alpha2 --output results/pit_shadow_v2_alpha3
 python run.py result-verify --output results/pit_shadow_v2_alpha3 --strict
+
+# 已归档 Bronze 的离线 PIT 构建（必须等 B0/B1/B3 pass）
+python run.py pit-lake-build --config config.yaml --archive-root data_lake
+python run.py pit-lake-verify --config config.yaml --archive-root data_lake
 
 # 公开通道下载
 python run.py public-download --membership csi300.csv --cache data/public_eastmoney --source sina

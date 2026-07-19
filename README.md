@@ -1,6 +1,6 @@
 # A股动态股票池多因子量化回测
 
-这是一个研究/回测级的 Python 项目。v1.5.1 根据真实公开历史回放把生产 Alpha 默认恢复为 `legacy_v1_4`；v1.6 在保持该 Alpha 与入选证券不变的前提下，新增可审计的收缩协方差组合模型和平方根市场冲击模型。V2.0 Alpha 1 新增独立的 Point-in-Time 财报/估值侧车，Alpha 2 新增固定因子研究，Alpha 3 再把固定 PIT 候选放入同一严格账本做四臂影子归因。所有 V2 候选仍为研究专用，不能从配置静默进入生产；v1.6 生产路径与结果保持不变。严格通道继续建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、部分成交、滑点和成交容量。
+这是一个研究/回测级的 Python 项目。v1.5.1 根据真实公开历史回放把生产 Alpha 默认恢复为 `legacy_v1_4`；v1.6 在保持该 Alpha 与入选证券不变的前提下，新增可审计的收缩协方差组合模型和平方根市场冲击模型。V2.0 Alpha 1 新增独立的 Point-in-Time 财报/估值侧车，Alpha 2 新增固定因子研究，Alpha 3 再把固定 PIT 候选放入同一严格账本做四臂影子归因，Alpha 4 把离线归档的 Bronze 数据以批次证据、Schema、行数和 SHA256 严格接入 PIT 侧车，Alpha 5 则新增真实数据一键验收、逐月历史覆盖和与数据指纹绑定的研究准入回执。所有 V2 候选仍为研究专用，不能从配置静默进入生产；v1.6 生产路径与结果保持不变。严格通道继续建模历史行业/市值、分红送股、信号与成交错位、涨跌停、停牌、退市、T+1、100 股整手、历史费用、部分成交、滑点和成交容量。
 
 > 重要：本项目不构成投资建议，不承诺收益，也没有连接券商下单。先用离线演示确认环境，再用自己的数据权限回测；任何真实资金使用前，都应做样本外检验、压力测试、人工复核和小资金仿真。
 
@@ -73,6 +73,18 @@ v1.5 实验候选的公式、冻结权重和原始协议详见 [`V1.5_ALPHA.md`]
 `2.0.0a7` 新增 `pit-shadow`：它先严格校验 Alpha 2 研究包和基础行情/PIT 双指纹，再用同一个严格账本运行生产价格基线、PIT 覆盖匹配价格臂、PIT 单独臂和固定 25% PIT 混合臂。覆盖匹配臂用于把缺失数据筛选效应与真正的 PIT 排名增量分开。
 
 影子执行分数结构上拒绝未来收益字段，候选无法写入生产 YAML。即使历史门槛全部通过，治理结果最多为 `eligible_for_forward_paper_tracking`。完整协议见 [`V2.0_ALPHA3_SHADOW_INTEGRATION.md`](V2.0_ALPHA3_SHADOW_INTEGRATION.md)。
+
+### V2.0 第四阶段：离线归档可信桥接
+
+`2.0.0a10` 新增 `pit-lake-build` 和 `pit-lake-verify`。严格模式只接受 B0/B1/B3 已 pass 的同快照任务，逐个复核批次 manifest、Bronze SHA256、Parquet 行数和 Schema 注册项，并以分桶流式处理把全量 `daily_basic` 与四个 VIP 财务端点转换为原 PIT v1 缓存。状态库始终以 SQLite 只读模式打开，命令不访问网络。
+
+样例必须显式加 `--fixture-mode`，生成的 manifest 固定写入 `research_eligible=false`；`pit-research` 和 `pit-shadow` 会硬拒绝这类缓存。完整证据链、扩展性设计和本地全量验收见 [`V2.0_ALPHA4_ARCHIVE_BRIDGE.md`](V2.0_ALPHA4_ARCHIVE_BRIDGE.md) 与 [`V2.0_ALPHA4_VALIDATION.md`](V2.0_ALPHA4_VALIDATION.md)。
+
+### V2.0 第五阶段：真实 PIT 验收门禁
+
+`2.0.0a11` 新增 `pit-acceptance`，把 Alpha4 缓存构建/复用、全部源 Bronze 与批次证据重放、PIT 时点约束、逐月历史活跃股票池覆盖和报告 SHA256 封存串成一条失败即关闭的验收链。strict 缓存只有取得与其 PIT/基础行情/任务集合指纹完全一致的 `pass` 回执后，才能运行 `pit-research` 或 `pit-shadow`。
+
+fixture 只能得到 `engineering_only`；任一隔离任务、源篡改、陈旧数据、覆盖不足或回执不匹配都会 `blocked`。批次门禁新增 `no_quarantined`，避免单个必需分区被 99.5% 成功率掩盖。协议和验证清单见 [`V2.0_ALPHA5_ACCEPTANCE.md`](V2.0_ALPHA5_ACCEPTANCE.md) 与 [`V2.0_ALPHA5_VALIDATION.md`](V2.0_ALPHA5_VALIDATION.md)。
 
 ## 二、回测中建模的 A 股约束
 
@@ -308,6 +320,30 @@ python run.py result-verify \
 
 快照会同时生成包含文件 SHA256、PIT 数据指纹和基础行情指纹的 `.manifest.json`。Alpha 2/3 研究目录同时封存基础行情和 PIT 两份数据身份；这些命令都不会自动让财报数据进入生产策略。
 
+若财报/估值已由归档流水线保存为 Bronze Parquet，不应再次调用网络下载器。等 B0、B1、B3 三批都 pass 后改用离线桥接：
+
+```bash
+python run.py pit-lake-build --config config.yaml \
+  --archive-root data_lake
+python run.py pit-lake-verify --config config.yaml \
+  --archive-root data_lake
+```
+
+新 strict 缓存还必须先取得 Alpha5 回执，再继续研究：
+
+```bash
+python run.py pit-acceptance --config config.yaml \
+  --archive-root data_lake \
+  --output results/pit_acceptance_v2_alpha5
+python run.py result-verify \
+  --output results/pit_acceptance_v2_alpha5 --strict
+python run.py pit-research --config config.yaml \
+  --acceptance-report results/pit_acceptance_v2_alpha5/acceptance_report.json \
+  --output results/pit_factor_research_v2_alpha2
+```
+
+`pit-acceptance` 默认复用已有缓存；不存在时会自动构建。任何必要阶段失败都会生成 `blocked` 报告并返回退出码 2。不完整交付样例只能显式加 `--fixture-mode`，结果固定为 `engineering_only`，不能产生 Alpha 研究证据。
+
 v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manifest.json` 保存所有实际输入文件的大小和 SHA256。旧 v3 缓存不能静默复用；首次升级必须把 `data.refresh` 改为 `true` 运行一次 `download`，完成后再改回 `false`。
 
 ## 四、输出文件
@@ -350,6 +386,10 @@ v1.4 严格缓存升级为 v4：新增独立的 `regime.csv.gz`，并在 `manife
 `pit-research` 默认在 `results/pit_factor_research_v2_alpha2/` 生成 PIT 因子面板、覆盖率、IC、分组收益、行业/市值暴露、消融、滚动验证、成本压力、治理决定、双数据指纹和产物 SHA256。输出目录必须为空；完整文件表见 [`V2.0_ALPHA2_FACTOR_RESEARCH.md`](V2.0_ALPHA2_FACTOR_RESEARCH.md)。
 
 `pit-shadow` 默认在 `results/pit_shadow_v2_alpha3/` 生成四臂严格账本、PIT 覆盖、年度一致性、选股重合、成本压力、治理决定和完整 SHA256。它要求 Alpha 2 目录先通过严格封存校验；完整文件表见 [`V2.0_ALPHA3_SHADOW_INTEGRATION.md`](V2.0_ALPHA3_SHADOW_INTEGRATION.md)。
+
+`pit-lake-build` 在 PIT 缓存内新增封存的 `archive_lineage.json.gz`，记录选中任务、源 Bronze/Raw/Schema 指纹和 B0/B1/B3 批次证据。该文件进入 PIT 数据集合指纹；提供 `--archive-root` 的 `pit-lake-verify` 会重放全部源文件 SHA256。fixture 缓存仍可导出快照，但其 `research_eligible=false` 不可被 Alpha2/Alpha3 消费。
+
+`pit-acceptance` 默认在 `results/pit_acceptance_v2_alpha5/` 生成 `acceptance_report.json`、人工摘要、复现身份和产物 manifest。报告包含构建/复用状态、完整源重放结果、每个月末的财报/估值覆盖、未达标日期、PIT/任务集合/批次身份和最终 `pass`、`engineering_only` 或 `blocked` 决策。新 strict 缓存的 Alpha2/Alpha3 产物还会记录所使用的 acceptance fingerprint。
 
 `public-research` 命令默认在 `results/public_research/` 生成：
 
@@ -454,7 +494,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 - 指数历史成分降低了幸存者偏差，但不能消除指数编制本身的选择偏差。
 - 分红送股已进入股份账本，但个人红利税与持有期相关，复杂税务仍需券商级清算数据。
 - 普通现金分红、送股和退市已处理；配股、换股吸收合并、破产重整等特殊事件仍需扩展。
-- 生产默认因子仍全部来自价格路径；V2.0 Alpha 3 已提供 PIT 固定候选的严格账本影子归因，但尚未取得本仓库绑定的真实全量 PIT 证据，也未进入生产选股。v1.6 协方差是长-only 收缩最小方差近似，不是完整 Barra 风险模型或精确二次规划器。
+- 生产默认因子仍全部来自价格路径；V2.0 Alpha 4 已能把全量归档严格接入 PIT 研究层，但当前云端交付只完成样例工程验收，尚未拿到 B3 全量 pass 产物，也未形成真实 Alpha 增量证据或进入生产选股。v1.6 协方差是长-only 收缩最小方差近似，不是完整 Barra 风险模型或精确二次规划器。
 - 申万行业成员和每日市值依赖数据源历史覆盖与修订；下载后的 v4 缓存与 `reproducibility.json` 必须和结果一起归档。
 - 行业/市值残差化是截面线性控制，不等于 Barra 类多因子风险模型，也不保证实际组合暴露严格为零。
 - 默认基准已切换为全收益指数，但实际数据源是否完整仍应通过 `validate-data` 确认。
@@ -464,7 +504,7 @@ python run.py result-verify --output results/public_research/robustness --strict
 
 ## 八、测试
 
-当前包含 124 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、数据/缓存完整性、未来数据隔离、冻结 Alpha 对照、排名缓冲、行业/单股约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、公司行动、研究封存，以及 v1.6 协方差分散/历史不足回退/防前视、换手平滑、冲击单调性/上限、组合可行性、容量部分成交与三日重试、低于整手容量拒单、订单审计、CLI 参数路由、严格/公开四臂归因、公开冲击成本账本和公开产物 SHA256 封存。V2 另覆盖公告/修订可见性、未来值扰动隔离、指标/单位契约、PIT 分区/证券身份与基础行情绑定、下载续传封存、确定性数据指纹、配置迁移、严格标量类型、版本锁一致性、快照 SHA256、Alpha 2 因子研究，以及 Alpha 3 禁止未来标签、覆盖匹配、四臂严格账本、Alpha2 前置门禁、双指纹与全产物封存。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
+当前包含 225 项测试，覆盖：Alpha 默认治理、命名配置冲突和旧 YAML 兼容、历史费率边界、T+1 股份批次、数据/缓存完整性、未来数据隔离、冻结 Alpha 对照、排名缓冲、行业/单股约束、信号日冻结股数、执行日 ST、涨停重试、现金与持仓恒等式、确定性黄金结果、公司行动、研究封存，以及 v1.6 协方差分散/历史不足回退/防前视、换手平滑、冲击单调性/上限、组合可行性、容量部分成交与三日重试、低于整手容量拒单、订单审计、CLI 参数路由、严格/公开四臂归因、公开冲击成本账本和公开产物 SHA256 封存。V2 另覆盖公告/修订可见性、未来值扰动隔离、指标/单位契约、PIT 分区/证券身份与基础行情绑定、下载续传封存、确定性数据指纹、配置迁移、严格标量类型、版本锁一致性、快照 SHA256、Alpha 2 因子研究、Alpha 3 四臂门禁、Alpha 4 路径重映射/状态库只读/批次与基础身份/Schema/行数/SHA256/流式转换/样例禁研/源篡改，以及 Alpha5 strict/fixture 决策、逐月历史覆盖、回执防篡改、输出隔离和 quarantined 硬门。可选 MiniRacer 未安装时，两个真实运行时压力测试会显示为跳过。
 
 ## 九、项目结构
 
@@ -485,6 +525,10 @@ a_share_quant/
 ├── V2.0_ALPHA2_VALIDATION.md # 第二阶段工程验收与真实数据复核命令
 ├── V2.0_ALPHA3_SHADOW_INTEGRATION.md # PIT 候选四臂严格账本与晋级边界
 ├── V2.0_ALPHA3_VALIDATION.md # 第三阶段工程验收与真实数据复核命令
+├── V2.0_ALPHA4_ARCHIVE_BRIDGE.md # Bronze→PIT 离线证据链、准入门与使用方式
+├── V2.0_ALPHA4_VALIDATION.md # 第四阶段样例验收与全量复核清单
+├── V2.0_ALPHA5_ACCEPTANCE.md # 真实 PIT 一键验收、时间切片和准入回执
+├── V2.0_ALPHA5_VALIDATION.md # 第五阶段工程验证与全量最终验收清单
 ├── V1.4_TRUSTWORTHINESS.md
 ├── V1.2_VALIDATION.md  # 改造验收、合成对照和压力结果
 ├── src/ashare_quant/
@@ -496,6 +540,8 @@ a_share_quant/
 │   ├── pit_data.py     # V2 PIT 财报/估值下载、封存、校验和快照
 │   ├── pit_research.py # V2 Alpha2 因子面板、诊断、治理与封存
 │   ├── pit_shadow.py   # V2 Alpha3 影子分数、严格账本四臂归因与治理
+│   ├── pit_lake.py     # V2 Alpha4 归档只读校验、流式转换与血缘重放
+│   ├── pit_acceptance.py # V2 Alpha5 数据验收、覆盖审计与防篡改回执
 │   ├── factors.py      # 因子、动态成分、选股、风险开关与权重
 │   ├── portfolio.py    # 逆波动率基线、收缩协方差和换手平滑
 │   ├── execution.py    # 固定滑点/平方根冲击公式与模型治理
@@ -507,7 +553,9 @@ a_share_quant/
     ├── test_public_research.py
     ├── test_pit_data.py
     ├── test_pit_research.py
-    └── test_pit_shadow.py
+    ├── test_pit_shadow.py
+    ├── test_pit_lake.py
+    └── test_pit_acceptance.py
 ```
 
 ## 十、规则与数据接口参考

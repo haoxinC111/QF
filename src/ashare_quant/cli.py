@@ -19,8 +19,11 @@ from .portfolio import SUPPORTED_PORTFOLIO_MODELS
 from .pit_data import (
     PointInTimeDataBundle,
     TusharePointInTimeDownloader,
+    require_pit_research_eligible,
     verify_pit_cache,
 )
+from .pit_lake import build_pit_cache_from_archive, verify_archive_pit_cache
+from .pit_acceptance import run_pit_acceptance
 from .pit_research import write_pit_factor_research
 from .pit_shadow import write_pit_shadow_research
 from .report import console_summary, write_report
@@ -38,6 +41,14 @@ from .public_research import (
     write_public_implementation_research,
     write_public_research,
     write_public_robustness,
+)
+from .archive import (
+    ArchiveConfig,
+    TushareCompatibleHttpProvider,
+    TaskStateDB,
+    default_inventory,
+    run_permission_probe,
+    run_phase_a_sample,
 )
 
 
@@ -118,6 +129,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     pit_research.add_argument("--train-years", type=int, default=5)
     pit_research.add_argument("--test-years", type=int, default=1)
+    pit_research.add_argument(
+        "--acceptance-report",
+        default="results/pit_acceptance_v2_alpha5/acceptance_report.json",
+        help="Alpha5 严格验收回执；新归档 PIT 缓存必须提供",
+    )
 
     pit_shadow = subparsers.add_parser(
         "pit-shadow",
@@ -140,6 +156,84 @@ def _parser() -> argparse.ArgumentParser:
         "--cost-bps",
         default="5,10,20",
         help="逗号分隔的固定滑点压力；PIT 混合权重固定不寻优",
+    )
+    pit_shadow.add_argument(
+        "--acceptance-report",
+        default="results/pit_acceptance_v2_alpha5/acceptance_report.json",
+        help="与当前 PIT 指纹绑定的 Alpha5 严格验收回执",
+    )
+
+    pit_lake_build = subparsers.add_parser(
+        "pit-lake-build",
+        help="离线将已验收 Bronze 归档转换为严格 PIT 研究缓存",
+    )
+    pit_lake_build.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+    pit_lake_build.add_argument(
+        "--archive-root", required=True, help="data_lake 根目录或 fixtures 根目录"
+    )
+    pit_lake_build.add_argument("--catalog", help="状态库路径；默认根目录 catalog/archive.duckdb")
+    pit_lake_build.add_argument("--schema-registry", help="Schema 注册目录")
+    pit_lake_build.add_argument("--reports-root", help="批次报告根目录")
+    pit_lake_build.add_argument("--output", help="输出 PIT 缓存；默认读取配置")
+    pit_lake_build.add_argument(
+        "--fixture-mode",
+        action="store_true",
+        help="显式允许不完整样例，仅用于工程验证且禁止 Alpha 研究",
+    )
+    pit_lake_build.add_argument("--buckets", type=int, default=32)
+    pit_lake_build.add_argument(
+        "--force", action="store_true", help="原子替换既有受支持 PIT 缓存"
+    )
+
+    pit_lake_verify = subparsers.add_parser(
+        "pit-lake-verify",
+        help="校验归档 PIT 缓存；可选重放所有 Bronze/Schema/批次 SHA256",
+    )
+    pit_lake_verify.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+    pit_lake_verify.add_argument("--output", help="PIT 缓存；默认读取配置")
+    pit_lake_verify.add_argument(
+        "--fixture-mode", action="store_true", help="校验工程样例缓存"
+    )
+    pit_lake_verify.add_argument(
+        "--archive-root", help="提供后会重放源 Bronze 与证据 SHA256"
+    )
+    pit_lake_verify.add_argument("--catalog", help="源状态库路径")
+    pit_lake_verify.add_argument("--schema-registry", help="源 Schema 注册目录")
+    pit_lake_verify.add_argument("--reports-root", help="源批次报告根目录")
+
+    pit_acceptance = subparsers.add_parser(
+        "pit-acceptance",
+        help="一键构建或复用 PIT、重放源证据并封存 Alpha5 验收回执",
+    )
+    pit_acceptance.add_argument(
+        "--config", default="config.yaml", help="YAML 配置文件"
+    )
+    pit_acceptance.add_argument(
+        "--archive-root", required=True, help="data_lake 或 fixtures 根目录"
+    )
+    pit_acceptance.add_argument("--catalog", help="归档状态库路径")
+    pit_acceptance.add_argument("--schema-registry", help="Schema 注册目录")
+    pit_acceptance.add_argument("--reports-root", help="批次报告根目录")
+    pit_acceptance.add_argument("--cache", help="PIT 缓存；默认读取配置")
+    pit_acceptance.add_argument(
+        "--output",
+        default="results/pit_acceptance_v2_alpha5",
+        help="必须不存在或为空的封存验收目录",
+    )
+    pit_acceptance.add_argument(
+        "--fixture-mode",
+        action="store_true",
+        help="只做工程验收，回执固定为 engineering_only",
+    )
+    pit_acceptance.add_argument("--buckets", type=int, default=32)
+    pit_acceptance.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="原子重建既有受支持 PIT 缓存；默认优先复用",
     )
 
     research = subparsers.add_parser(
@@ -246,7 +340,31 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="同时拒绝 artifact_manifest.json 未登记的额外文件",
     )
+
+    archive_probe = subparsers.add_parser(
+        "archive-probe", help="对归档 endpoint 做权限探针并生成 permission_report.json"
+    )
+    archive_probe.add_argument(
+        "--config", default="config.archive.yaml", help="归档 YAML 配置文件"
+    )
+    archive_probe.add_argument(
+        "--priorities", default="P0,P1", help="逗号分隔的优先级过滤"
+    )
+
+    archive_sample = subparsers.add_parser(
+        "archive-sample", help="执行 Phase A 小样本归档（5日/50股/4季度）"
+    )
+    archive_sample.add_argument(
+        "--config", default="config.archive.yaml", help="归档 YAML 配置文件"
+    )
     return parser
+
+
+def _load_archive_config(path_text: str) -> ArchiveConfig:
+    path = Path(path_text).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"找不到归档配置文件: {path}")
+    return ArchiveConfig.from_yaml(path)
 
 
 def _load_config(path_text: str) -> AppConfig:
@@ -274,10 +392,19 @@ def _run_backtest(
     print(f"完整报告: {Path(config.backtest.output_dir) / 'report.html'}")
 
 
-def _pit_bundle(config: AppConfig) -> PointInTimeDataBundle:
+def _pit_bundle(
+    config: AppConfig, *, require_research_eligible: bool = False
+) -> PointInTimeDataBundle:
     if not config.point_in_time.enabled:
         raise ValueError(
             "PIT 数据未启用；请在 point_in_time.enabled 设置为 true"
+        )
+    manifest_path = Path(config.point_in_time.cache_dir) / "manifest.json"
+    if require_research_eligible:
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"缺少 PIT manifest: {manifest_path}")
+        require_pit_research_eligible(
+            json.loads(manifest_path.read_text(encoding="utf-8"))
         )
     return PointInTimeDataBundle.from_cache(
         config.point_in_time.cache_dir,
@@ -453,7 +580,155 @@ def _dispatch(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if args.command == "archive-probe":
+        archive_config = _load_archive_config(args.config)
+        archive_config.validate_for_run(batch_id="A_probe")
+        provider = TushareCompatibleHttpProvider(
+            url_env=archive_config.provider.base_url_env,
+            token_env=archive_config.provider.token_env,
+            forbid_token_env=archive_config.provider.forbid_token_env,
+            source_provider=archive_config.provider.name,
+            allowed_hosts=archive_config.provider.allowed_hosts,
+            connect_timeout=archive_config.provider.request.get(
+                "connect_timeout_seconds", 10.0
+            ),
+            read_timeout=archive_config.provider.request.get(
+                "read_timeout_seconds", 120.0
+            ),
+            accept_encoding=archive_config.provider.request.get(
+                "accept_encoding", "gzip"
+            ),
+            follow_cross_host_redirects=archive_config.provider.request.get(
+                "follow_cross_host_redirects", False
+            ),
+            api_key_env=archive_config.provider.api_key_env,
+            api_key_header=archive_config.provider.api_key_header,
+        )
+        inventory = default_inventory()
+        priorities = [p.strip() for p in args.priorities.split(",") if p.strip()]
+        report = run_permission_probe(archive_config, provider, inventory, priorities)
+        # Merge probe results into the endpoint inventory artifact.
+        from .archive.probe import probe_results_for_inventory
+
+        inventory_path = archive_config.catalog_dir / "endpoint_inventory.yaml"
+        inventory.to_yaml(inventory_path, probe_results=probe_results_for_inventory(report))
+        summary = report["summary"]
+        print(
+            f"权限探针完成: {summary.get('success', 0)} 成功 / "
+            f"{summary.get('confirmed_empty', 0)} 空 / "
+            f"{summary.get('denied', 0)} 拒绝 / "
+            f"{summary.get('invalid_params', 0)} 参数错误 / "
+            f"{summary.get('not_found', 0)} 未找到 / "
+            f"{summary.get('incompatible', 0)} 不兼容 / "
+            f"{summary.get('transient_error', 0)} 瞬时错误，"
+            f"报告 {archive_config.reports_dir / 'permission_report.json'}，"
+            f"清单 {inventory_path}"
+        )
+        return 0
+
+    if args.command == "archive-sample":
+        archive_config = _load_archive_config(args.config)
+        archive_config.validate_for_run(batch_id="A_probe")
+        provider = TushareCompatibleHttpProvider(
+            url_env=archive_config.provider.base_url_env,
+            token_env=archive_config.provider.token_env,
+            forbid_token_env=archive_config.provider.forbid_token_env,
+            source_provider=archive_config.provider.name,
+            allowed_hosts=archive_config.provider.allowed_hosts,
+            connect_timeout=archive_config.provider.request.get(
+                "connect_timeout_seconds", 10.0
+            ),
+            read_timeout=archive_config.provider.request.get(
+                "read_timeout_seconds", 120.0
+            ),
+            accept_encoding=archive_config.provider.request.get(
+                "accept_encoding", "gzip"
+            ),
+            follow_cross_host_redirects=archive_config.provider.request.get(
+                "follow_cross_host_redirects", False
+            ),
+            api_key_env=archive_config.provider.api_key_env,
+            api_key_header=archive_config.provider.api_key_header,
+        )
+        inventory = default_inventory()
+        db = TaskStateDB(archive_config.catalog_dir / "archive.duckdb")
+        summary = run_phase_a_sample(archive_config, provider, inventory, db)
+        print(
+            f"Phase A 样本完成: {summary['tasks_completed']} 成功 / "
+            f"{summary['tasks_failed']} 失败 / {summary['tasks_empty']} 空，"
+            f"总行数 {summary['rows_total']}，耗时 {summary['elapsed_seconds']}s"
+        )
+        return 0
+
     config = _load_config(args.config)
+    if args.command == "pit-lake-build":
+        manifest = build_pit_cache_from_archive(
+            config,
+            args.archive_root,
+            catalog_path=args.catalog,
+            schema_registry=args.schema_registry,
+            reports_root=args.reports_root,
+            output_dir=args.output,
+            fixture_mode=args.fixture_mode,
+            bucket_count=args.buckets,
+            overwrite=args.force,
+        )
+        quality = manifest["data_quality"]
+        print(
+            "归档 PIT 构建完成: "
+            f"模式 {manifest['archive_bridge']['mode']}，"
+            f"财报 {quality['fundamental_rows']:,} 行，"
+            f"估值 {quality['valuation_rows']:,} 行，"
+            f"研究资格 {manifest['research_eligible']}，"
+            f"指纹 {manifest['data_fingerprint_sha256']}"
+        )
+        if manifest["archive_bridge"].get("acceptance_required"):
+            print(
+                "下一步必须运行 pit-acceptance 生成与该指纹绑定的严格验收回执，"
+                "再运行 pit-research / pit-shadow。"
+            )
+        return 0
+    if args.command == "pit-lake-verify":
+        verification = verify_archive_pit_cache(
+            config,
+            args.output or config.point_in_time.cache_dir,
+            fixture_mode=args.fixture_mode,
+            archive_root=args.archive_root,
+            catalog_path=args.catalog,
+            schema_registry=args.schema_registry,
+            reports_root=args.reports_root,
+        )
+        print(
+            "归档 PIT 校验通过: "
+            f"模式 {verification['mode']}，"
+            f"任务 {verification['selected_task_count']}，"
+            f"源文件复核 {verification['source_files_verified']}，"
+            f"研究资格 {verification['research_eligible']}，"
+            f"指纹 {verification['data_fingerprint_sha256']}"
+        )
+        return 0
+    if args.command == "pit-acceptance":
+        report = run_pit_acceptance(
+            config,
+            args.archive_root,
+            catalog_path=args.catalog,
+            schema_registry=args.schema_registry,
+            reports_root=args.reports_root,
+            cache_dir=args.cache,
+            output_dir=args.output,
+            fixture_mode=args.fixture_mode,
+            bucket_count=args.buckets,
+            rebuild_cache=args.rebuild_cache,
+        )
+        print(
+            "Alpha5 PIT 验收完成: "
+            f"decision={report['decision']}，"
+            f"mode={report['mode']}，"
+            f"research_eligible={report['research_eligible']}，"
+            f"指纹={report['acceptance_fingerprint_sha256']}，"
+            f"报告={Path(args.output).resolve()}"
+        )
+        return 2 if report["decision"] == "blocked" else 0
     if args.command == "pit-download":
         bundle = TusharePointInTimeDownloader(config).download()
         quality = bundle.manifest["data_quality"]
@@ -532,7 +807,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             strict=config.data.strict_validation,
             expected_config=config,
         )
-        pit_bundle = _pit_bundle(config)
+        pit_bundle = _pit_bundle(config, require_research_eligible=True)
         factors = [
             value.strip() for value in args.factors.split(",") if value.strip()
         ]
@@ -559,6 +834,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             cost_bps=costs,
             train_years=args.train_years,
             test_years=args.test_years,
+            acceptance_report=args.acceptance_report,
         )
         print("PIT Alpha2 因子研究完成（生产策略未改变）:")
         for name, path in written.items():
@@ -570,7 +846,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             strict=config.data.strict_validation,
             expected_config=config,
         )
-        pit_bundle = _pit_bundle(config)
+        pit_bundle = _pit_bundle(config, require_research_eligible=True)
         costs = [
             float(value.strip())
             for value in args.cost_bps.split(",")
@@ -583,6 +859,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.output,
             alpha2_research_dir=args.alpha2_research,
             cost_bps=costs,
+            acceptance_report=args.acceptance_report,
         )
         print("PIT Alpha3 严格账本影子归因完成（生产策略未改变）:")
         for name, path in written.items():

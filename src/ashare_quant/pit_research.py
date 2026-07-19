@@ -12,7 +12,8 @@ import pandas as pd
 
 from .config import AppConfig
 from .data import MarketDataBundle
-from .pit_data import PointInTimeDataBundle
+from .pit_data import PointInTimeDataBundle, require_pit_research_eligible
+from .pit_acceptance import require_pit_acceptance
 from .provenance import (
     build_reproducibility_manifest,
     record_experiment,
@@ -1006,7 +1007,9 @@ def run_pit_factor_rolling_validation(
     window = 1
     while test_start <= overall_end:
         test_end = min(
-            test_start + pd.DateOffset(years=test_years) - pd.Timedelta(days=1),
+            test_start
+            + pd.DateOffset(years=test_years)
+            - pd.Timedelta(1, unit="D"),
             overall_end,
         )
         subset = panel.loc[
@@ -1024,7 +1027,7 @@ def run_pit_factor_rolling_validation(
                 {
                     "window": window,
                     "train_start": overall_start,
-                    "train_end": test_start - pd.Timedelta(days=1),
+                    "train_end": test_start - pd.Timedelta(1, unit="D"),
                     "test_start": test_start,
                     "test_end": test_end,
                     "signal_dates": int(subset["signal_date"].nunique()),
@@ -1032,7 +1035,7 @@ def run_pit_factor_rolling_validation(
                     **evidence,
                 }
             )
-        test_start = test_end + pd.Timedelta(days=1)
+        test_start = test_end + pd.Timedelta(1, unit="D")
         window += 1
     return pd.DataFrame(records)
 
@@ -1349,6 +1352,7 @@ def write_pit_factor_research(
     cost_bps: Sequence[float] = (5.0, 10.0, 20.0),
     train_years: int = 5,
     test_years: int = 1,
+    acceptance_report: str | Path | None = None,
 ) -> dict[str, Path]:
     names = resolve_pit_factor_names(factor_names)
     requested_horizons = sorted({int(value) for value in horizons})
@@ -1368,6 +1372,8 @@ def write_pit_factor_research(
         raise FileNotFoundError("PIT 研究必须绑定基础行情与 PIT 两份 manifest")
     base_manifest = json.loads(base_manifest_path.read_text(encoding="utf-8"))
     pit_manifest = json.loads(pit_manifest_path.read_text(encoding="utf-8"))
+    require_pit_research_eligible(pit_manifest)
+    acceptance = require_pit_acceptance(pit_manifest, acceptance_report)
     if pit.manifest:
         expected = pit.manifest.get("data_fingerprint_sha256")
         actual = pit_manifest.get("data_fingerprint_sha256")
@@ -1489,14 +1495,22 @@ def write_pit_factor_research(
         "train_years": train_years,
         "test_years": test_years,
         "automatic_parameter_fitting": False,
+        "pit_acceptance_fingerprint_sha256": (
+            acceptance.get("acceptance_fingerprint_sha256")
+            if acceptance is not None
+            else None
+        ),
     }
+    extra_inputs = [pit_manifest_path]
+    if acceptance is not None and acceptance_report is not None:
+        extra_inputs.append(Path(acceptance_report).resolve())
     reproducibility = build_reproducibility_manifest(
         {
             "app_config": config.to_dict(),
             "pit_factor_research": research_parameters,
         },
         data_manifest_path=base_manifest_path,
-        extra_input_files=[pit_manifest_path],
+        extra_input_files=extra_inputs,
     )
     reproducibility["pit_data"] = {
         "manifest_path": str(pit_manifest_path),
@@ -1509,6 +1523,16 @@ def write_pit_factor_research(
             "base_data_fingerprint_sha256"
         ),
     }
+    reproducibility["pit_acceptance"] = (
+        {
+            "report_path": str(Path(acceptance_report).resolve()),
+            "acceptance_fingerprint_sha256": acceptance.get(
+                "acceptance_fingerprint_sha256"
+            ),
+        }
+        if acceptance is not None and acceptance_report is not None
+        else None
+    )
     reproducibility_path = write_json_atomic(
         reproducibility, output / "reproducibility.json"
     )

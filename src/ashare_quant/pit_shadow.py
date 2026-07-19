@@ -14,7 +14,8 @@ from .backtest import BacktestResult, Backtester
 from .config import AppConfig
 from .data import MarketDataBundle
 from .factors import MultiFactorStrategy, _winsorized_zscore
-from .pit_data import PointInTimeDataBundle
+from .pit_data import PointInTimeDataBundle, require_pit_research_eligible
+from .pit_acceptance import require_pit_acceptance
 from .pit_research import (
     PIT_COMPOSITE_NAME,
     PIT_FACTOR_RESEARCH_VERSION,
@@ -957,6 +958,7 @@ def write_pit_shadow_research(
     *,
     alpha2_research_dir: str | Path,
     cost_bps: Sequence[float] = (5.0, 10.0, 20.0),
+    acceptance_report: str | Path | None = None,
 ) -> dict[str, Path]:
     if not config.point_in_time.enabled:
         raise ValueError("PIT 影子研究要求 point_in_time.enabled=true")
@@ -974,6 +976,8 @@ def write_pit_shadow_research(
         raise FileNotFoundError("PIT 影子研究必须绑定基础行情与 PIT manifest")
     base_manifest = _read_json(base_manifest_path)
     pit_manifest = _read_json(pit_manifest_path)
+    require_pit_research_eligible(pit_manifest)
+    acceptance = require_pit_acceptance(pit_manifest, acceptance_report)
     base_fingerprint = str(base_manifest.get("data_fingerprint_sha256", ""))
     pit_fingerprint = str(pit_manifest.get("data_fingerprint_sha256", ""))
     if not base_fingerprint or not pit_fingerprint:
@@ -1075,19 +1079,27 @@ def write_pit_shadow_research(
         "arms": list(PIT_SHADOW_ARMS),
         "cost_bps": normalized_cost_bps,
         "automatic_parameter_fitting": False,
+        "pit_acceptance_fingerprint_sha256": (
+            acceptance.get("acceptance_fingerprint_sha256")
+            if acceptance is not None
+            else None
+        ),
     }
+    extra_inputs = [
+        pit_manifest_path,
+        alpha2["manifest_path"],
+        alpha2["governance_path"],
+        alpha2["artifact_path"],
+    ]
+    if acceptance is not None and acceptance_report is not None:
+        extra_inputs.append(Path(acceptance_report).resolve())
     reproducibility = build_reproducibility_manifest(
         {
             "app_config": config.to_dict(),
             "pit_shadow_research": parameters,
         },
         data_manifest_path=base_manifest_path,
-        extra_input_files=[
-            pit_manifest_path,
-            alpha2["manifest_path"],
-            alpha2["governance_path"],
-            alpha2["artifact_path"],
-        ],
+        extra_input_files=extra_inputs,
     )
     reproducibility["pit_data"] = {
         "manifest_path": str(pit_manifest_path),
@@ -1095,6 +1107,16 @@ def write_pit_shadow_research(
         "data_fingerprint_sha256": pit_fingerprint,
         "base_data_fingerprint_sha256": base_fingerprint,
     }
+    reproducibility["pit_acceptance"] = (
+        {
+            "report_path": str(Path(acceptance_report).resolve()),
+            "acceptance_fingerprint_sha256": acceptance.get(
+                "acceptance_fingerprint_sha256"
+            ),
+        }
+        if acceptance is not None and acceptance_report is not None
+        else None
+    )
     reproducibility["alpha2_research"] = {
         "directory": str(alpha2["root"]),
         "manifest_sha256": sha256_file(alpha2["manifest_path"]),
