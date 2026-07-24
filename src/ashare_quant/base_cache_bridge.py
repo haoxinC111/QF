@@ -354,12 +354,15 @@ def build_industry_membership(member_all: pd.DataFrame, members: set[str]) -> pd
     result = raw.rename(
         columns={"ts_code": "symbol", "l1_code": "industry_code", "l1_name": "industry_name"}
     )
-    return (
-        result[INDUSTRY_COLUMNS]
-        .drop_duplicates()
-        .sort_values(["symbol", "in_date"])
-        .reset_index(drop=True)
-    )
+    result = result[INDUSTRY_COLUMNS].drop_duplicates()
+    # is_new=Y/N 双叶子会对同一 (symbol, industry_code, in_date) 各给一行
+    # (一行 out_date 为空、一行 out_date 非空)。按 B0 修复验收口径
+    # 「历史有效日期(out_date 非空)优先」裁决,与交付的去重并集一致。
+    result["_out_filled"] = result["out_date"].notna() & (result["out_date"].astype(str) != "")
+    result = result.sort_values("_out_filled", ascending=False)
+    result = result.drop_duplicates(["symbol", "industry_code", "in_date"], keep="first")
+    result = result.drop(columns=["_out_filled"])
+    return result.sort_values(["symbol", "in_date"]).reset_index(drop=True)
 
 
 def build_index_frame(frames: list[pd.DataFrame], ts_code: str) -> pd.DataFrame:

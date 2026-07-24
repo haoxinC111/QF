@@ -85,7 +85,7 @@ def main() -> int:
 
     report = {
         "archive_root": str(ARCHIVE_ROOT),
-        "catalog_sha256": "32ce478375271345b90087a9d02354fb2d0471a257b03e7c4d2e727c1b60e077",
+        "catalog_sha256": hashlib.sha256(CATALOG.read_bytes()).hexdigest(),
         "success_tasks": total,
         "files_checked": checked,
         "file_sha256_ok": checked - decompressed_sha - len(sha_mismatch),

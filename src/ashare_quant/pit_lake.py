@@ -80,6 +80,10 @@ TERMINAL_STATUSES = {
     "superseded_invalid_partition",
     "superseded_truncated_cap",
     "superseded_legacy_collision",
+    # 2026-07-24 B0 截断修复引入:namechange ann_date 窗口任务让位于全宇宙
+    # 逐 ts_code 权威分区(窗口模式实测静默丢行 + schema 漂移,见
+    # B0_repair/b0_gap_analysis.json),旧任务保留文件、仅状态迁移。
+    "superseded_incomplete_window",
     "orphaned_context_drift",
     "aborted_prestart",
 }

@@ -48,8 +48,12 @@ from ashare_quant.provenance import (  # noqa: E402
     sha256_file,
 )
 
+# 交付状态库快照钉定。历史值:
+#   2026-07-23 首轮交付 32ce478375271345b90087a9d02354fb2d0471a257b03e7c4d2e727c1b60e077
+#   (该快照含 index_member_all/namechange 静默截断,G7/G8 fail-closed);
+#   当前值为 2026-07-24 B0 截断修复后的快照。
 DELIVERED_CATALOG_SHA256 = (
-    "32ce478375271345b90087a9d02354fb2d0471a257b03e7c4d2e727c1b60e077"
+    "1d6acee0f1182253f966047b0adfcf9c6c09ddfa2036b7b172963fc33edd1d11"
 )
 REQUIRED_APIS = {
     "trade_cal", "stock_basic", "index_weight", "index_daily", "daily",
@@ -197,7 +201,11 @@ def main() -> int:
 
     # ---------- G7: 申万行业成员覆盖(历史区间) ----------
     ima_tasks = by_api("index_member_all")
-    ima = read_bronze(ima_tasks[0], archive_root) if ima_tasks else pd.DataFrame()
+    # 修复后权威分区为 64 叶子(32 申万 L1 × is_new Y/N),必须对全部 success
+    # 叶子 concat;只读 tasks[0] 会漏掉绝大多数成员。
+    ima = pd.concat(
+        [read_bronze(t, archive_root) for t in ima_tasks], ignore_index=True
+    ) if ima_tasks else pd.DataFrame()
     industry = build_industry_membership(ima, members) if not ima.empty else pd.DataFrame()
     ind_symbols = set(industry["symbol"].astype(str)) if not industry.empty else set()
     missing_industry = sorted(members - ind_symbols)
@@ -213,20 +221,43 @@ def main() -> int:
         {
             "missing_members": missing_industry,
             "cap_suspect_tasks": cap_suspect,
-            "note": "index_member_all 全表单拉恰 3000 行且无 is_new=N 历史行,判定网关静默截断",
+            "note": "行数恰整千的全量任务按疑似截断处理;权威分区为 64 叶子(32 申万 L1 × is_new Y/N)全量 concat",
         },
     ))
 
     # ---------- G8: 更名记录完整性(is_st 语义) ----------
     nc_tasks = by_api("namechange")
-    nc = read_bronze(nc_tasks[0], archive_root) if nc_tasks else pd.DataFrame()
+    # 修复后权威分区为全宇宙 5,864 个逐 ts_code 任务,必须全部 concat。
+    nc = pd.concat(
+        [read_bronze(t, archive_root) for t in nc_tasks], ignore_index=True
+    ) if nc_tasks else pd.DataFrame()
     nc_codes = set(nc["ts_code"].astype(str)) if not nc.empty else set()
     st_now = securities[
         securities["name"].astype(str).str.contains("ST|退", case=False, na=False)
     ]
     st_members = sorted(set(st_now["symbol"].astype(str)) & members)
     nc_st_codes = set(nc.loc[nc["name"].astype(str).str.contains("ST|退", case=False, na=False), "ts_code"].astype(str)) if not nc.empty else set()
-    st_without_record = [s for s in st_members if s not in nc_st_codes]
+    # 证据精化豁免:namechange 端点只记录更名事件,吸收合并退市不是更名。
+    # 当前名带「退」但无 ST/退 更名记录的成员,若同时满足 (a) master 有
+    # delist_date (b) 其全部更名记录已在并集,则「(退)」是退市标记而非历史名,
+    # 豁免并全量记录(B0 修复验收门 9 同口径,如 601989.SH 中国重工)。
+    delist_map = dict(zip(securities["symbol"].astype(str), securities["delist_date"])) if not securities.empty else {}
+    st_without_record: list[str] = []
+    st_exemptions: list[dict] = []
+    for s in st_members:
+        if s in nc_st_codes:
+            continue
+        code_records = nc.loc[nc["ts_code"].astype(str) == s] if not nc.empty else pd.DataFrame()
+        has_delist = pd.notna(delist_map.get(s)) and str(delist_map.get(s)) not in ("", "None")
+        if has_delist and not code_records.empty:
+            st_exemptions.append({
+                "symbol": s,
+                "delist_date": str(delist_map.get(s)),
+                "union_records": int(len(code_records)),
+                "rule": "退市非更名:delist_date 存在且全量更名记录已在并集",
+            })
+        else:
+            st_without_record.append(s)
     nc_cap_suspect = [
         {"api_name": t.api_name, "row_count": t.row_count, "task_id": t.task_id}
         for t in nc_tasks if t.row_count > 0 and t.row_count % 1000 == 0
@@ -234,11 +265,13 @@ def main() -> int:
     g8_ok = not st_without_record and not nc_cap_suspect and not nc.empty
     gates.append(GateResult(
         "G8_namechange_integrity", g8_ok,
-        f"更名记录 {len(nc)} 行覆盖 {len(nc_codes)} 只; 当前 ST 成员缺记录 {len(st_without_record)}; 疑似截断 {len(nc_cap_suspect)}",
+        f"更名记录 {len(nc)} 行覆盖 {len(nc_codes)} 只; 当前 ST 成员缺记录 {len(st_without_record)}; "
+        f"退市标记豁免 {len(st_exemptions)}; 疑似截断 {len(nc_cap_suspect)}",
         {
             "st_members_without_record": st_without_record,
+            "st_delist_exemptions": st_exemptions,
             "cap_suspect_tasks": nc_cap_suspect,
-            "note": "namechange 恰 10000 行且 ann_date 不早于 2020-12,判定网关静默截断",
+            "note": "行数恰整千的全量任务按疑似截断处理;退市标记豁免须有 delist_date 且全量更名记录在并集",
         },
     ))
 
@@ -301,7 +334,9 @@ def main() -> int:
     per_symbol: dict[str, dict[str, list[pd.DataFrame]]] = {
         s: {"daily": [], "adj": [], "basic": [], "limit": []} for s in member_list
     }
-    dates_sorted = sorted(daily_dates)
+    dates_sorted = sorted(
+        d for d in daily_dates if warmup_start <= pd.Timestamp(d) <= end
+    )
     for i, d in enumerate(dates_sorted, 1):
         day_daily = read_bronze(daily_tasks[d], archive_root)
         day_adj = read_bronze(adj_tasks[d], archive_root, ["ts_code", "trade_date", "adj_factor"])
