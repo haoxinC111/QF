@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -31,7 +32,7 @@ from ashare_quant.archive import (
     TushareCompatibleHttpProvider,
 )
 from ashare_quant.archive.config import ProviderConfig, RateLimitConfig
-from ashare_quant.archive.pipeline import EndpointSpec
+from ashare_quant.archive.pipeline import EndpointSpec, task_id
 from ashare_quant.archive.probe import _default_probe_params, probe_endpoint
 from ashare_quant.archive.provider import _redact_payload
 from ashare_quant.archive.registry import InventoryEndpoint
@@ -319,9 +320,10 @@ class TestPipelineTruncationAndResume(unittest.TestCase):
                 ["ts_code", "trade_date", "close"],
                 [["000001.SZ", "20250110", "10"]] * 3,
             )
+            # 不重叠二分: 左 [0101,0105], 右 [0106,0110]。
             provider.register(
                 "daily",
-                {"start_date": "20250101", "end_date": "20250106"},
+                {"start_date": "20250101", "end_date": "20250105"},
                 ["ts_code", "trade_date", "close"],
                 [["000001.SZ", "20250105", "10"]],
             )
@@ -1180,6 +1182,786 @@ class TestBatchExpansion(unittest.TestCase):
         self.assertEqual(len(specs), 2)  # 2 只主力指数 x 1 年段
         codes = {s.params_template["index_code"] for s in specs}
         self.assertEqual(codes, {"000300.SH", "000905.SH"})
+
+
+class TestB2RepairRegressions(unittest.TestCase):
+    """B2_repair 回归: 显式 fields、行数上限、不重叠二分、BISECTED 终态。
+
+    背景(2026-07-20): 网关对 index_weight 单次响应有 7000 行硬上限且超限
+    时静默保留尾部月份;个别全年查询还会返回仅 con_code 一列的畸形 schema。
+    以下测试防止显式 fields 或上限配置回退。
+    """
+
+    def _make_config(self, tmp: str) -> ArchiveConfig:
+        provider = ProviderConfig(
+            kind="mock",
+            name="mock",
+            base_url_env="QF_ARCHIVE_API_URL",
+            token_env="QF_ARCHIVE_API_TOKEN",
+        )
+        return ArchiveConfig(
+            schema_version=1,
+            provider=provider,
+            rate_limit=RateLimitConfig(calls_per_minute=1000),
+            archive_root=Path(tmp),
+            raw_format="json.zst",
+            table_format="parquet",
+            parquet_compression="zstd",
+            immutable_raw=True,
+            save_all_fields=True,
+            write_request_manifest=True,
+            write_schema_fingerprint=True,
+            checksum="sha256",
+            scope={},
+            completeness={},
+            point_in_time={},
+            batches=[],
+        )
+
+    def test_index_weight_registry_fields_empty_and_cap(self) -> None:
+        """index_weight 必须 fields=""(全粒度)且登记 row_cap=7000。
+
+        显式 fields 会让网关只返回月末权重(丢月中调样快照);
+        未登记 row_cap 则 7000 行硬上限的静默截断无法被检测。
+        """
+        from ashare_quant.archive.registry import default_inventory
+
+        ep = default_inventory().endpoints["index_weight"]
+        self.assertEqual(ep.fields, "")
+        self.assertEqual(ep.row_cap, 7000)
+        spec = ep.to_spec()
+        self.assertEqual(spec.fields, "")
+        self.assertEqual(spec.row_cap, 7000)
+
+    def test_spec_row_cap_triggers_bisect_without_observed_cap(self) -> None:
+        """规格级 row_cap 在没有任何运行时探测时也必须触发截断拆分。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._make_config(tmp)
+            provider = MockArchiveProvider()
+            provider.register(
+                "index_weight",
+                {"index_code": "X", "start_date": "20250101", "end_date": "20251231"},
+                ["index_code", "con_code", "trade_date", "weight"],
+                [["X", "000001.SZ", "20251231", 1.0]] * 3,
+            )
+            provider.register(
+                "index_weight",
+                {"index_code": "X", "start_date": "20250101", "end_date": "20250702"},
+                ["index_code", "con_code", "trade_date", "weight"],
+                [["X", "000001.SZ", "20250630", 1.0]],
+            )
+            provider.register(
+                "index_weight",
+                {"index_code": "X", "start_date": "20250703", "end_date": "20251231"},
+                ["index_code", "con_code", "trade_date", "weight"],
+                [["X", "000001.SZ", "20251231", 1.0]],
+            )
+            db = TaskStateDB(config.catalog_dir / "tasks.db")
+            pipeline = ArchivePipeline(config, provider, db, snapshot_id="snap_cap")
+            # 注意: 不设置 pipeline.observed_caps,只靠规格级 row_cap。
+            spec = EndpointSpec(
+                api_name="index_weight",
+                dataset="index_membership",
+                priority="P0",
+                primary_key=["index_code", "trade_date", "con_code"],
+                primary_split="trade_date",
+                fallback_split="index_code",
+                all_fields=True,
+                fields="index_code,con_code,trade_date,weight",
+                params_template={"index_code": "X", "start_date": "20250101", "end_date": "20251231"},
+                row_cap=3,
+            )
+            result = pipeline.run_tasks([spec])
+            self.assertEqual(result.tasks_completed, 2)
+            from ashare_quant.archive.pipeline import task_id
+
+            parent_id = task_id("mock", "index_weight", dict(spec.params_template), spec.fields, "snap_cap")
+            parent = db.get(parent_id)
+            self.assertEqual(parent.status, TaskStatus.BISECTED)
+            self.assertEqual(len(parent.metadata.get("bisected_into", [])), 2)
+            # 不重叠且不丢天: 左 [0101,0702], 右 [0703,1231]。
+            left = db.get(parent.metadata["bisected_into"][0])
+            right = db.get(parent.metadata["bisected_into"][1])
+            self.assertEqual(
+                (left.params["start_date"], left.params["end_date"]),
+                ("20250101", "20250702"),
+            )
+            self.assertEqual(
+                (right.params["start_date"], right.params["end_date"]),
+                ("20250703", "20251231"),
+            )
+            self.assertEqual(left.status, TaskStatus.SUCCESS)
+            self.assertEqual(right.status, TaskStatus.SUCCESS)
+
+    def test_unsplittable_parent_stays_suspect_truncated(self) -> None:
+        """无法再拆分时父任务保持 suspect_truncated,进入 failure_queue。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._make_config(tmp)
+            provider = MockArchiveProvider()
+            provider.register(
+                "index_weight",
+                {"index_code": "X", "trade_date": "20250110"},
+                ["index_code", "con_code", "trade_date", "weight"],
+                [["X", "000001.SZ", "20250110", 1.0]] * 3,
+            )
+            db = TaskStateDB(config.catalog_dir / "tasks.db")
+            pipeline = ArchivePipeline(config, provider, db, snapshot_id="snap_unsplit")
+            spec = EndpointSpec(
+                api_name="index_weight",
+                dataset="index_membership",
+                priority="P0",
+                primary_key=["index_code", "trade_date", "con_code"],
+                primary_split="trade_date",
+                fallback_split="index_code",
+                all_fields=True,
+                fields="index_code,con_code,trade_date,weight",
+                params_template={"index_code": "X", "trade_date": "20250110"},
+                row_cap=3,
+            )
+            pipeline.run_tasks([spec])
+            from ashare_quant.archive.pipeline import task_id
+
+            parent = db.get(task_id("mock", "index_weight", dict(spec.params_template), spec.fields, "snap_unsplit"))
+            self.assertEqual(parent.status, TaskStatus.SUSPECT_TRUNCATED)
+
+
+class TestB3RowCapRegressions(unittest.TestCase):
+    """B3_financial 9 端点 row_cap 登记回归(2026-07-21 预检实测)。
+
+    实测硬上限: balancesheet_vip=7000, income_vip=9000, fina_indicator_vip=12000,
+    fina_mainbz_vip=10000(单季度恰满), disclosure_date=6000(单年恰满)。
+    cashflow_vip/forecast_vip/express_vip/fina_audit 上限不可探(多码被拒或
+    未触顶),登记保守默认 7000。B3 任务按 symbol 拆全历史,单股最大历史
+    ~1,570 行(fina_mainbz_vip),上限本不可达;登记只为防御+重启后仍生效。
+    """
+
+    EXPECTED_CAPS = {
+        "income_vip": 9000,
+        "balancesheet_vip": 7000,
+        "cashflow_vip": 7000,
+        "fina_indicator_vip": 12000,
+        "forecast_vip": 7000,
+        "express_vip": 7000,
+        "fina_audit": 7000,
+        "fina_mainbz_vip": 10000,
+        "disclosure_date": 6000,
+    }
+
+    def test_b3_endpoints_row_cap_registered(self) -> None:
+        from ashare_quant.archive.registry import default_inventory
+
+        endpoints = default_inventory().endpoints
+        for api, cap in self.EXPECTED_CAPS.items():
+            ep = endpoints[api]
+            self.assertEqual(ep.batch, "B3_financial", api)
+            self.assertEqual(ep.row_cap, cap, api)
+            self.assertEqual(ep.to_spec().row_cap, cap, api)
+
+    def test_b3_endpoints_fields_empty(self) -> None:
+        """canary 实测(2026-07-21): 9 端点 fields="" 与显式 fields 主键集合
+        与列完全一致;统一 fields="" 避免 index_weight 式粒度退化。"""
+        from ashare_quant.archive.registry import default_inventory
+
+        endpoints = default_inventory().endpoints
+        for api in self.EXPECTED_CAPS:
+            self.assertEqual(endpoints[api].fields, "", api)
+
+
+class TestB3PrimaryKeyRegressions(unittest.TestCase):
+    """B3 财务版本主键回归(2026-07-21 用户指令)。
+
+    报表类主键必须纳入全部版本字段,确保同一报告期的修订/更正版本共存,
+    Bronze 绝不按简化主键去重。列存在性依据 preflight/b3_columns.json 实测。
+    """
+
+    EXPECTED_PKS = {
+        "income_vip": ["ts_code", "end_date", "ann_date", "f_ann_date", "report_type", "comp_type", "update_flag"],
+        "balancesheet_vip": ["ts_code", "end_date", "ann_date", "f_ann_date", "report_type", "comp_type", "update_flag"],
+        "cashflow_vip": ["ts_code", "end_date", "ann_date", "f_ann_date", "report_type", "comp_type", "update_flag"],
+        "fina_indicator_vip": ["ts_code", "end_date", "ann_date", "update_flag"],
+        "forecast_vip": ["ts_code", "end_date", "ann_date", "type", "update_flag"],
+        "express_vip": ["ts_code", "end_date", "ann_date", "update_flag"],
+        "fina_audit": ["ts_code", "end_date", "ann_date"],
+        "fina_mainbz_vip": ["ts_code", "end_date", "bz_item", "bz_code"],
+        "disclosure_date": ["ts_code", "end_date"],
+    }
+
+    def test_b3_primary_keys_include_revision_fields(self) -> None:
+        from ashare_quant.archive.registry import default_inventory
+
+        endpoints = default_inventory().endpoints
+        for api, pk in self.EXPECTED_PKS.items():
+            self.assertEqual(endpoints[api].primary_key, pk, api)
+
+    def test_revision_rows_coexist_in_bronze(self) -> None:
+        """同一 (ts_code,end_date) 的多版公告必须全部落盘,一行不丢。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            from ashare_quant.archive.storage import load_bronze_parquet, store_response
+
+            columns = ["ts_code", "end_date", "ann_date", "f_ann_date", "report_type", "comp_type", "update_flag", "revenue"]
+            items = [
+                ["000001.SZ", "20241231", "20250315", "20250315", "1", "2", "0", 100.0],   # 首版
+                ["000001.SZ", "20241231", "20250420", "20250315", "1", "2", "1", 105.0],   # 修订版(update_flag 变化)
+                ["000001.SZ", "20241231", "20250420", "20250315", "4", "2", "1", 105.0],   # 更正公告(report_type 变化)
+            ]
+            stored = store_response(
+                Path(tmp) / "raw", Path(tmp) / "bronze", "income_vip", {},
+                columns, items, b"{}", snapshot_id="snap_rev", partition_key="k",
+            )
+            df = load_bronze_parquet(stored.bronze_path)
+            self.assertEqual(len(df), 3)
+            self.assertEqual(sorted(df["revenue"]), [100.0, 105.0, 105.0])
+            self.assertEqual(df["update_flag"].tolist(), ["0", "1", "1"])
+
+    def test_aborted_prestart_status_exists(self) -> None:
+        self.assertEqual(TaskStatus.ABORTED_PRESTART.value, "aborted_prestart")
+
+
+class TestProviderRetryAfter(unittest.TestCase):
+    """429 响应必须透出 Retry-After 头供调用方退避(2026-07-21)。"""
+
+    def test_retry_after_header_parsed(self) -> None:
+        fake = FakeSession([FakeResponse(429, raw=b"slow down", headers={"Retry-After": "7"})])
+        provider = _http_provider(fake)
+        resp = provider.request("daily", {"trade_date": "20250102"})
+        self.assertEqual(resp.status, "transient_error")
+        self.assertEqual(resp.retry_after_seconds, 7.0)
+
+    def test_retry_after_absent_defaults_none(self) -> None:
+        fake = FakeSession([FakeResponse(429, raw=b"slow down")])
+        provider = _http_provider(fake)
+        resp = provider.request("daily", {"trade_date": "20250102"})
+        self.assertIsNone(resp.retry_after_seconds)
+
+    def test_retry_after_non_numeric_ignored(self) -> None:
+        fake = FakeSession([FakeResponse(429, raw=b"slow down", headers={"Retry-After": "soon"})])
+        provider = _http_provider(fake)
+        resp = provider.request("daily", {"trade_date": "20250102"})
+        self.assertIsNone(resp.retry_after_seconds)
+
+
+class _DripResponse:
+    """持续慢滴字节的服务端响应:每个分块间隔都小于 read timeout,
+    但累计耗时超过总期限——复现 2026-07-21 B3 假死场景。"""
+
+    def __init__(self, payload: bytes, chunk_seconds: float, chunk_size: int = 4096) -> None:
+        self.status_code = 200
+        self.headers: dict[str, str] = {}
+        self.is_redirect = False
+        self._payload = payload
+        self._chunk_seconds = chunk_seconds
+        self._chunk_size = chunk_size
+        self.closed = False
+
+    def iter_content(self, chunk_size: int = 65536):
+        for i in range(0, len(self._payload), self._chunk_size):
+            time.sleep(self._chunk_seconds)
+            yield self._payload[i : i + self._chunk_size]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestTotalResponseDeadline(unittest.TestCase):
+    """180s 硬性总响应期限回归(2026-07-21 用户指令)。
+
+    服务端持续滴字节但不触发 read timeout 时,累计到期必须主动中断,
+    标记 transient_error(pipeline 进而标 retryable),不完整字节不发布。
+    """
+
+    def test_slow_drip_aborted_by_total_deadline(self) -> None:
+        payload = json.dumps({"code": 0, "msg": "", "data": {"fields": ["a"], "items": [[1]] * 100}}).encode()
+        # 每 0.05s 滴 4KB: 单次间隔远小于 read timeout,20+ 块累计 > 0.3s 期限。
+        drip = _DripResponse(payload * 50, chunk_seconds=0.05, chunk_size=4096)
+        fake = FakeSession([drip])
+        with patch.dict(os.environ, dict(_HTTP_ENV), clear=True):
+            provider = TushareCompatibleHttpProvider(session=fake, total_deadline_seconds=0.3)
+        start = time.monotonic()
+        resp = provider.request("balancesheet_vip", {"ts_code": "688168.SH"})
+        elapsed = time.monotonic() - start
+        self.assertEqual(resp.status, "transient_error")
+        self.assertIn("总响应期限超时", resp.message)
+        self.assertEqual(resp.raw_payload, b"")  # 不完整字节不进入响应
+        self.assertLess(elapsed, 5.0)  # 远早于完整滴完(~100s+)
+        self.assertTrue(drip.closed)  # 连接被主动关闭
+
+    def test_normal_response_within_deadline_unaffected(self) -> None:
+        fake = FakeSession([FakeResponse(200, payload=_ok_payload())])
+        with patch.dict(os.environ, dict(_HTTP_ENV), clear=True):
+            provider = TushareCompatibleHttpProvider(session=fake, total_deadline_seconds=30.0)
+        resp = provider.request("daily", {"trade_date": "20250102"})
+        self.assertTrue(resp.is_success)
+
+    def test_drip_task_marked_retryable_and_nothing_published(self) -> None:
+        """管线级: 滴字节任务经总期限中断后标 retryable_error,Raw/Bronze 零落盘。"""
+        payload = json.dumps({"code": 0, "msg": "", "data": {"fields": ["a"], "items": [[1]] * 100}}).encode()
+        drip = _DripResponse(payload * 50, chunk_seconds=0.05, chunk_size=4096)
+        fake = FakeSession([drip] * 3)  # 重试 3 次都是滴字节
+        with patch.dict(os.environ, dict(_HTTP_ENV), clear=True):
+            provider = TushareCompatibleHttpProvider(session=fake, total_deadline_seconds=0.3)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = TestB2RepairRegressions()._make_config(tmp)
+            db = TaskStateDB(config.catalog_dir / "tasks.db")
+            pipeline = ArchivePipeline(config, provider, db, snapshot_id="snap_drip")
+            spec = EndpointSpec(
+                api_name="balancesheet_vip",
+                dataset="financial_pit",
+                priority="P0",
+                primary_key=["ts_code", "end_date"],
+                primary_split="period",
+                fallback_split="ts_code",
+                all_fields=True,
+                fields="",
+                params_template={"ts_code": "688168.SH"},
+            )
+            result = pipeline.run_tasks([spec])
+            self.assertEqual(result.tasks_failed, 1)
+            from ashare_quant.archive.pipeline import task_id
+
+            task = db.get(task_id(config.provider.name, "balancesheet_vip", dict(spec.params_template), "", "snap_drip"))
+            self.assertEqual(task.status, TaskStatus.RETRYABLE_ERROR)
+            self.assertIn("总响应期限超时", task.last_error)
+            # 原子性: 不完整响应不产生任何 Raw/Bronze 文件。
+            self.assertEqual(list(Path(tmp).rglob("*.json.zst")), [])
+            self.assertEqual(list(Path(tmp).rglob("*.parquet")), [])
+            self.assertEqual(list(Path(tmp).rglob("*.tmp")), [])
+
+
+class TestResumeSpecsLoading(unittest.TestCase):
+    """断点续跑 fail-closed 回归(2026-07-22 用户指令, context 漂移事件)。
+
+    创建 snapshot 后交易日推进一天,恢复时 task ID、任务数、参数和
+    manifest SHA 必须完全不变;context 缺失/SHA 不符/参数被篡改时
+    必须 fail-closed,禁止按最新交易日重建。
+    """
+
+    def _setup(self, tmp: str, *, with_context_sha: bool = True):
+        from ashare_quant.archive.registry import default_inventory
+        from ashare_quant.archive.state import DownloadTask, TaskStateDB, TaskStatus
+
+        config = TestPipelineHelpers._make_config(self, tmp)
+        db = TaskStateDB(config.catalog_dir / "tasks.db")
+        inventory = default_inventory()
+        ep = inventory.endpoints["balancesheet_vip"]
+        snapshot = "snapA"
+        codes = ["000001.SZ", "000002.SZ", "000003.SZ"]
+        rows = []
+        for code in codes:
+            params = {"ts_code": code, "start_date": "19950101", "end_date": "20260720"}
+            tid = task_id("mock", "balancesheet_vip", params, "", snapshot)
+            db.upsert(DownloadTask(
+                task_id=tid, api_name="balancesheet_vip", params=params, fields="",
+                dataset=ep.dataset, priority=ep.priority, primary_key=list(ep.primary_key),
+                primary_split=ep.primary_split, fallback_split=ep.fallback_split,
+                status=TaskStatus.SUCCESS, row_count=100,
+            ))
+            rows.append((tid, params))
+        reports_dir = config.reports_dir / "batches" / "B9_test"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        context_sha = "a" * 64
+        manifest = {
+            "schema_version": 1, "snapshot_id": snapshot, "provider": "mock",
+            "total_tasks": len(rows), "by_status": {"success": len(rows)},
+            "tasks": [{"task_id": tid, "api_name": "balancesheet_vip"} for tid, _ in rows],
+        }
+        if with_context_sha:
+            manifest["context_sha256"] = context_sha
+        manifest_path = reports_dir / "batch_manifest.jsonl"
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        (reports_dir / f"context_{context_sha[:12]}.json").write_text(
+            json.dumps({"context_sha256": context_sha, "latest_trade_date": "20260720"}),
+            encoding="utf-8")
+        return config, db, inventory, snapshot, rows, manifest_path, reports_dir
+
+    def test_resume_invariant_to_trade_date_advance(self) -> None:
+        """交易日推进一天(存在漂移 context)时,回放结果必须完全不变。"""
+        from ashare_quant.archive.batch import load_resume_specs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, db, inventory, snapshot, rows, manifest_path, reports_dir = self._setup(tmp)
+            # 模拟"交易日推进一天": 目录里多出一个新日期的漂移 context。
+            drifted_sha = "b" * 64
+            (reports_dir / f"context_{drifted_sha[:12]}.json").write_text(
+                json.dumps({"context_sha256": drifted_sha, "latest_trade_date": "20260721"}),
+                encoding="utf-8")
+            sha_before = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            specs = load_resume_specs(config, db, inventory, "B9_test", snapshot)
+            self.assertEqual(len(specs), 3)  # 任务数不变
+            for (tid, params), spec in zip(rows, specs, strict=True):
+                self.assertEqual(spec.params_template, params)  # 参数不变(end_date=20260720)
+                self.assertEqual(spec.params_template["end_date"], "20260720")
+                self.assertEqual(task_id("mock", spec.api_name, spec.params_template,
+                                         spec.fields, snapshot), tid)  # task ID 不变
+            sha_after = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            self.assertEqual(sha_before, sha_after)  # manifest SHA 不变
+
+    def test_resume_fail_closed_on_missing_manifest(self) -> None:
+        from ashare_quant.archive.batch import load_resume_specs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, db, inventory, snapshot, rows, manifest_path, _ = self._setup(tmp)
+            manifest_path.unlink()
+            with self.assertRaises(FileNotFoundError):
+                load_resume_specs(config, db, inventory, "B9_test", snapshot)
+
+    def test_resume_fail_closed_on_context_sha_mismatch(self) -> None:
+        from ashare_quant.archive.batch import load_resume_specs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, db, inventory, snapshot, rows, _, reports_dir = self._setup(tmp)
+            # 封存 context 文件内容与 manifest 记录的 SHA 不符。
+            (reports_dir / f"context_{'a' * 12}.json").write_text(
+                json.dumps({"context_sha256": "c" * 64}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_resume_specs(config, db, inventory, "B9_test", snapshot)
+
+    def test_resume_fail_closed_on_ambiguous_legacy_context(self) -> None:
+        """老 manifest 无 context_sha256 且存在多个 context 文件时 fail-closed。"""
+        from ashare_quant.archive.batch import load_resume_specs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, db, inventory, snapshot, rows, _, reports_dir = self._setup(
+                tmp, with_context_sha=False)
+            drifted_sha = "b" * 64
+            (reports_dir / f"context_{drifted_sha[:12]}.json").write_text(
+                json.dumps({"context_sha256": drifted_sha}), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_resume_specs(config, db, inventory, "B9_test", snapshot)
+
+    def test_resume_fail_closed_on_tampered_params(self) -> None:
+        """db 行参数与 task_id 不一致(疑似篡改)时 fail-closed。"""
+        import sqlite3
+
+        from ashare_quant.archive.batch import load_resume_specs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, db, inventory, snapshot, rows, _, _ = self._setup(tmp)
+            tid, params = rows[0]
+            # upsert 设计上拒绝改 params(身份不可变),用原生 SQL 模拟篡改。
+            tampered = dict(params, end_date="20260721")
+            with sqlite3.connect(db.path) as conn:
+                conn.execute(
+                    "UPDATE archive_tasks SET params_json=? WHERE task_id=?",
+                    (json.dumps(tampered, sort_keys=True, ensure_ascii=False), tid),
+                )
+            with self.assertRaises(ValueError):
+                load_resume_specs(config, db, inventory, "B9_test", snapshot)
+
+    def test_orphaned_context_drift_status_exists(self) -> None:
+        self.assertEqual(TaskStatus.ORPHANED_CONTEXT_DRIFT.value, "orphaned_context_drift")
+        self.assertEqual(TaskStatus.SUPERSEDED_INVALID_PARTITION.value,
+                         "superseded_invalid_partition")
+
+    def test_superseded_truncated_cap_status_exists(self) -> None:
+        """2026-07-23 B4 repair: 恰满真实 cap 被截断的任务由窗口二分任务集替代。"""
+        self.assertEqual(TaskStatus.SUPERSEDED_TRUNCATED_CAP.value,
+                         "superseded_truncated_cap")
+
+    def test_superseded_legacy_collision_status_exists(self) -> None:
+        """2026-07-23 B2 清理: 撞名事件僵尸 running 由新一代覆盖区间任务承载。"""
+        self.assertEqual(TaskStatus.SUPERSEDED_LEGACY_COLLISION.value,
+                         "superseded_legacy_collision")
+
+
+class TestFrozenSpecs(unittest.TestCase):
+    """冻结任务清单回归(2026-07-22 用户指令): 物化封存后,无论交易日如何
+    推进,启动/恢复回放的 task ID、任务数、参数和 manifest SHA 必须不变。"""
+
+    def _frozen(self, tmp: str):
+        from ashare_quant.archive.batch import save_frozen_specs
+        from ashare_quant.archive.registry import default_inventory
+
+        config = TestPipelineHelpers._make_config(self, tmp)
+        inventory = default_inventory()
+        ep = inventory.endpoints["pledge_stat"]
+        specs = []
+        for code in ("000001.SZ", "000002.SZ"):
+            spec = ep.to_spec()
+            spec.params_template = {"ts_code": code}
+            specs.append(spec)
+        ctx_record = {"context_sha256": "d" * 64, "latest_trade_date": "20260721"}
+        path = Path(tmp) / "frozen_specs_snapF.json"
+        payload = save_frozen_specs(
+            path, batch_id="B9_test", snapshot_id="snapF",
+            provider_name="mock", context_record=ctx_record, specs=specs,
+        )
+        return config, inventory, path, payload
+
+    def test_frozen_roundtrip_invariant(self) -> None:
+        from ashare_quant.archive.batch import load_frozen_specs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, inventory, path, payload = self._frozen(tmp)
+            sha_before = hashlib.sha256(path.read_bytes()).hexdigest()
+            snapshot, specs = load_frozen_specs(path, config, inventory)
+            self.assertEqual(snapshot, "snapF")
+            self.assertEqual(len(specs), 2)  # 任务数不变
+            self.assertEqual([s.params_template["ts_code"] for s in specs],
+                             ["000001.SZ", "000002.SZ"])  # 参数不变
+            ids = sorted(task_id("mock", s.api_name, s.params_template, s.fields, "snapF")
+                         for s in specs)
+            manifest_sha = hashlib.sha256("\n".join(ids).encode()).hexdigest()
+            self.assertEqual(manifest_sha, payload["manifest_sha256"])  # task ID/manifest SHA 不变
+            self.assertEqual(sha_before, hashlib.sha256(path.read_bytes()).hexdigest())
+
+    def test_frozen_fail_closed_on_tamper(self) -> None:
+        from ashare_quant.archive.batch import load_frozen_specs
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, inventory, path, payload = self._frozen(tmp)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["specs"][0]["params"]["ts_code"] = "600000.SH"  # 篡改参数
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_frozen_specs(path, config, inventory)
+
+    def test_resume_falls_back_to_frozen_when_manifest_missing(self) -> None:
+        from ashare_quant.archive.batch import load_resume_specs
+        from ashare_quant.archive.state import TaskStateDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config, inventory, frozen_path, _ = self._frozen(tmp)
+            reports_dir = config.reports_dir / "batches" / "B9_test"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            target = reports_dir / "frozen_specs_snapF.json"
+            target.write_text(frozen_path.read_text(encoding="utf-8"), encoding="utf-8")
+            db = TaskStateDB(config.catalog_dir / "tasks.db")  # 空库: 批次尚未运行
+            specs = load_resume_specs(config, db, inventory, "B9_test", "snapF")
+            self.assertEqual(len(specs), 2)
+
+    def test_resume_fail_closed_when_neither_manifest_nor_frozen(self) -> None:
+        from ashare_quant.archive.batch import load_resume_specs
+        from ashare_quant.archive.state import TaskStateDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = TestPipelineHelpers._make_config(self, tmp)
+            from ashare_quant.archive.registry import default_inventory
+            db = TaskStateDB(config.catalog_dir / "tasks.db")
+            with self.assertRaises(FileNotFoundError):
+                load_resume_specs(config, db, default_inventory(), "B9_test", "snapX")
+
+
+class TestB4Regressions(unittest.TestCase):
+    """B4_events 8 端点注册回归(2026-07-22 预检实测)。
+
+    实测要点(preflight/b4_canary.json + b4_followup.json):
+    - repurchase row_cap=2000(宽区间/年度/202402 月恰满;月拆+自动二分);
+    - share_float 多码 chunk 静默空、top10_holders 多码 chunk 静默截断
+      (000001.SZ 单查 298 行 vs chunk 内 58 行),split_unit 必须 symbol;
+    - 其余端点单码全历史最大 141~1,108 行,上限不可达,登记保守 7000。
+    """
+
+    EXPECTED_PKS = {
+        "repurchase": ["ts_code", "ann_date", "end_date"],
+        "share_float": ["ts_code", "float_date"],
+        "pledge_stat": ["ts_code", "end_date"],
+        "pledge_detail": ["ts_code", "start_date", "pledgor"],
+        "stk_holdernumber": ["ts_code", "end_date", "ann_date"],
+        "stk_holdertrade": ["ts_code", "ann_date", "holder_name", "in_de"],
+        "top10_holders": ["ts_code", "end_date", "holder_name"],
+        "top10_floatholders": ["ts_code", "end_date", "holder_name"],
+    }
+    EXPECTED_CAPS = {
+        "repurchase": 2000,
+        # 6000 实测(2026-07-23 B4): 持有人粒度,528 只全历史恰好 6000 行截断
+        "share_float": 6000,
+        "pledge_stat": 7000,
+        "pledge_detail": 7000,
+        "stk_holdernumber": 7000,
+        "stk_holdertrade": 7000,
+        "top10_holders": 7000,
+        "top10_floatholders": 7000,
+    }
+    EXPECTED_SPLIT_UNITS = {
+        "repurchase": "month",
+        "share_float": "symbol",
+        "pledge_stat": "symbol",
+        "pledge_detail": "symbol",
+        "stk_holdernumber": "symbol",
+        "stk_holdertrade": "symbol",
+        "top10_holders": "symbol",
+        "top10_floatholders": "symbol",
+    }
+
+    def test_b4_primary_keys(self) -> None:
+        from ashare_quant.archive.registry import default_inventory
+
+        endpoints = default_inventory().endpoints
+        for api, pk in self.EXPECTED_PKS.items():
+            self.assertEqual(endpoints[api].primary_key, pk, api)
+
+    def test_b4_row_caps_registered(self) -> None:
+        from ashare_quant.archive.registry import default_inventory
+
+        endpoints = default_inventory().endpoints
+        for api, cap in self.EXPECTED_CAPS.items():
+            self.assertEqual(endpoints[api].row_cap, cap, api)
+
+    def test_b4_split_units_symbol_or_month(self) -> None:
+        """share_float/top10_holders 严禁回退到 symbol_chunk(静默空/截断)。"""
+        from ashare_quant.archive.registry import default_inventory
+
+        endpoints = default_inventory().endpoints
+        for api, unit in self.EXPECTED_SPLIT_UNITS.items():
+            self.assertEqual(endpoints[api].split_unit, unit, api)
+
+    def test_b4_fields_empty(self) -> None:
+        """B4 全部端点 fields=""(top10_floatholders 显式 fields 返回空,实测)。"""
+        from ashare_quant.archive.registry import default_inventory
+
+        endpoints = default_inventory().endpoints
+        for api in self.EXPECTED_PKS:
+            self.assertEqual(endpoints[api].fields, "", api)
+
+
+class _DriftFallbackProvider(MockArchiveProvider):
+    """fields="" 返回缺字段畸形响应;显式 fields 行为可编排(成功/仍缺字段/未知 schema)。"""
+
+    SUSPEND_FULL = ["ts_code", "trade_date", "suspend_timing", "suspend_type"]
+    SUSPEND_DRIFT = ["ts_code", "suspend_type", "suspend_timing"]
+
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode  # "success" | "still_drift" | "unknown_schema"
+        self.calls: list[tuple[str, str]] = []
+
+    def request(self, api_name, params=None, *, fields=""):
+        self.calls.append((api_name, fields))
+        if fields:
+            cols = {
+                "success": self.SUSPEND_FULL,
+                "still_drift": self.SUSPEND_DRIFT,
+                "unknown_schema": ["ts_code", "some_new_col"],
+            }[self.mode]
+        else:
+            cols = self.SUSPEND_DRIFT
+        items = [["000001.SZ", "20260708", "09:30", "S"]] if cols != ["ts_code", "some_new_col"] else [["x", 1]]
+        key = f"{api_name}:{json.dumps(dict(params or {}), sort_keys=True, ensure_ascii=False)}"
+        self._responses[key] = items
+        self._columns[api_name] = cols
+        return super().request(api_name, params, fields=fields)
+
+
+class TestExplicitFieldsFallback(TestPipelineHelpers):
+    """E 类缺字段显式 fields 回退(2026-07-23 用户批准,图片方案第 4 条)。"""
+
+    REGISTERED_FP = "b10eeb0e0474db9a146be4ea05bdd994bf0224ffe30e7c1b0d0644217fb1ad3d"
+
+    def _setup(self, tmp: str, mode: str):
+        config = self._make_config(tmp)
+        db = TaskStateDB(config.catalog_dir / "tasks.db")
+        provider = _DriftFallbackProvider(mode)
+        pipeline = ArchivePipeline(config, provider, db, snapshot_id="snap1")
+        pipeline.schema_registry.save("suspend_d", self.REGISTERED_FP, {
+            "endpoint": "suspend_d", "fingerprint": self.REGISTERED_FP,
+            "columns": _DriftFallbackProvider.SUSPEND_FULL,
+            "snapshot_id": "snap1", "row_count": 0,
+        })
+        spec = EndpointSpec(
+            api_name="suspend_d", dataset="trading_status", priority="P0",
+            primary_key=["ts_code", "trade_date"], primary_split="trade_date",
+            fallback_split=None, all_fields=True, fields="",
+            params_template={"trade_date": "20260708"},
+        )
+        return config, db, provider, pipeline, spec
+
+    def test_fallback_success(self) -> None:
+        """缺字段畸形 → 显式 fields 回退成功 → success,审计完整。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            config, db, provider, pipeline, spec = self._setup(tmp, "success")
+            result = pipeline.run_tasks([spec])
+            self.assertEqual(result.tasks_completed, 1)
+            tid = task_id("mock", "suspend_d", {"trade_date": "20260708"}, "", "snap1")
+            task = db.get(tid)
+            self.assertEqual(task.status, TaskStatus.SUCCESS)
+            audit = task.metadata["explicit_fields_fallback"]
+            self.assertTrue(audit["accepted"])
+            self.assertEqual(audit["explicit_fields"],
+                             "ts_code,trade_date,suspend_timing,suspend_type")
+            self.assertEqual(len(audit["drift_response_sha256"]), 64)
+            self.assertEqual(len(audit["retry_response_sha256"]), 64)
+            # 审计 JSONL + 畸形原始响应存档
+            audit_log = config.catalog_dir / "migrations" / "explicit_fields_fallback_audit.jsonl"
+            self.assertTrue(audit_log.exists())
+            self.assertTrue((config.catalog_dir / "quarantine_evidence" / f"{tid}_drift.json").exists())
+
+    def test_fallback_still_drift_stays_quarantined(self) -> None:
+        """回退响应仍缺字段 → 不接受,保持 quarantined。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, db, _, pipeline, spec = self._setup(tmp, "still_drift")
+            result = pipeline.run_tasks([spec])
+            self.assertEqual(result.tasks_completed, 0)
+            tid = task_id("mock", "suspend_d", {"trade_date": "20260708"}, "", "snap1")
+            task = db.get(tid)
+            self.assertEqual(task.status, TaskStatus.QUARANTINED)
+            self.assertFalse(task.metadata["explicit_fields_fallback"]["accepted"])
+
+    def test_unknown_schema_no_fallback(self) -> None:
+        """回退响应出现未知/新增列 → 禁止回退,保持 quarantined。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, db, _, pipeline, spec = self._setup(tmp, "unknown_schema")
+            pipeline.run_tasks([spec])
+            tid = task_id("mock", "suspend_d", {"trade_date": "20260708"}, "", "snap1")
+            self.assertEqual(db.get(tid).status, TaskStatus.QUARANTINED)
+
+    def test_at_most_one_retry(self) -> None:
+        """每个任务最多一次显式 fields 重试。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, provider, pipeline, spec = self._setup(tmp, "still_drift")
+            pipeline.run_tasks([spec])
+            explicit_calls = [c for c in provider.calls if c[1]]
+            self.assertEqual(len(explicit_calls), 1)
+
+    def test_task_identity_stable(self) -> None:
+        """回退前后 task_id 不变(fields 不入身份)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, db, _, pipeline, spec = self._setup(tmp, "success")
+            tid_before = task_id("mock", "suspend_d", dict(spec.params_template), spec.fields, "snap1")
+            pipeline.run_tasks([spec])
+            task = db.get(tid_before)
+            self.assertIsNotNone(task)
+            self.assertEqual(task.task_id, tid_before)
+            self.assertEqual(task.fields, "")
+
+    def test_original_response_not_overwritten(self) -> None:
+        """畸形原始响应存档于 quarantine_evidence 且内容与回退响应不同。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            config, db, _, pipeline, spec = self._setup(tmp, "success")
+            pipeline.run_tasks([spec])
+            tid = task_id("mock", "suspend_d", {"trade_date": "20260708"}, "", "snap1")
+            drift = (config.catalog_dir / "quarantine_evidence" / f"{tid}_drift.json").read_bytes()
+            task = db.get(tid)
+            audit = task.metadata["explicit_fields_fallback"]
+            self.assertEqual(hashlib.sha256(drift).hexdigest(), audit["drift_response_sha256"])
+            self.assertNotEqual(audit["drift_response_sha256"], audit["retry_response_sha256"])
+            # Raw 落盘文件(压缩)解压后的载荷 SHA = 回退响应 SHA
+            import zstandard
+            payload = zstandard.ZstdDecompressor().stream_reader(
+                open(task.raw_path, "rb")).read()
+            self.assertEqual(hashlib.sha256(payload).hexdigest(),
+                             audit["retry_response_sha256"])
+
+    def test_non_whitelisted_endpoint_no_fallback(self) -> None:
+        """非白名单端点即使缺字段也不回退(无显式 fields 调用)。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._make_config(tmp)
+            db = TaskStateDB(config.catalog_dir / "tasks.db")
+            provider = _DriftFallbackProvider("success")
+            pipeline = ArchivePipeline(config, provider, db, snapshot_id="snap1")
+            full = ["ts_code", "trade_date", "close"]
+            fp = schema_fingerprint(full)
+            pipeline.schema_registry.save("daily", fp, {
+                "endpoint": "daily", "fingerprint": fp, "columns": full,
+                "snapshot_id": "snap1", "row_count": 0})
+            spec = EndpointSpec(
+                api_name="daily", dataset="market_daily", priority="P0",
+                primary_key=["ts_code", "trade_date"], primary_split="trade_date",
+                fallback_split=None, all_fields=True, fields="",
+                params_template={"trade_date": "20260708"})
+            pipeline.run_tasks([spec])
+            tid = task_id("mock", "daily", {"trade_date": "20260708"}, "", "snap1")
+            self.assertEqual(db.get(tid).status, TaskStatus.QUARANTINED)
+            self.assertEqual([c for c in provider.calls if c[1]], [])
 
 
 if __name__ == "__main__":

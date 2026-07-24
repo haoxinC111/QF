@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from .config import ArchiveConfig
@@ -119,6 +120,8 @@ class BatchContext:
         latest_report_period: str,
         index_codes: list[str] | None = None,
         index_codes_main: list[str] | None = None,
+        context_sha256: str = "",
+        sources: list[dict[str, Any]] | None = None,
     ) -> None:
         self.universe = universe
         self.trade_dates = trade_dates
@@ -126,6 +129,10 @@ class BatchContext:
         self.latest_report_period = latest_report_period
         self.index_codes = index_codes or []
         self.index_codes_main = index_codes_main or []
+        # 上下文构建来源(本地封存文件 SHA 或 API 参数)与整体 SHA,
+        # 用于审计 context 出自哪些封存数据(2026-07-21 用户指令)。
+        self.context_sha256 = context_sha256
+        self.sources = sources or []
 
 
 def _spec(ep: InventoryEndpoint, params: dict[str, Any]) -> EndpointSpec:
@@ -247,9 +254,16 @@ def batch_decision_gates(
     """Return fail-closed research gates for one sealed batch snapshot."""
     success = by_status.get("success", 0)
     confirmed_empty = by_status.get("confirmed_empty", 0)
+    # 父任务触发行数上限被拆分且子任务全部终态解决,数据由子任务承载(已解决终态)
+    bisected = by_status.get("bisected", 0)
+    # 已被替代任务集承载数据的任务,同属已解决终态:
+    # 拆分方式无效 / 恰满真实 cap 被静默截断 / 撞名事件僵尸 running
+    superseded = by_status.get("superseded_invalid_partition", 0)
+    superseded += by_status.get("superseded_truncated_cap", 0)
+    superseded += by_status.get("superseded_legacy_collision", 0)
     return {
         "all_tasks_terminal": (
-            success + confirmed_empty + by_status.get("quarantined", 0)
+            success + confirmed_empty + bisected + superseded + by_status.get("quarantined", 0)
         )
         == total,
         "no_suspect_truncated": by_status.get("suspect_truncated", 0) == 0,
@@ -261,7 +275,7 @@ def batch_decision_gates(
         "no_denied": by_status.get("denied", 0) == 0,
         "no_invalid_params": by_status.get("invalid_params", 0) == 0,
         "success_rate_ge_99.5%": (
-            success / max(1, total - confirmed_empty)
+            (success + bisected) / max(1, total - confirmed_empty)
         )
         >= 0.995,
     }
@@ -276,6 +290,8 @@ def write_batch_artifacts(
     result: Any,
     started_at: str,
     elapsed: float,
+    *,
+    context_sha256: str = "",
 ) -> dict[str, Any]:
     """Write the six per-batch artifacts and return the decision dict."""
     reports_dir = config.reports_dir / BATCH_ARTIFACT_DIR / batch_id
@@ -292,6 +308,8 @@ def write_batch_artifacts(
 
     # 1. batch_manifest.jsonl
     manifest = build_manifest(config, db, snapshot_id, tasks=batch_tasks)
+    # 记录本批次封存 context 的 SHA,供断点续跑 fail-closed 校验(2026-07-22)。
+    manifest["context_sha256"] = context_sha256
     manifest_path = reports_dir / "batch_manifest.jsonl"
     with manifest_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(manifest, ensure_ascii=False) + "\n")
@@ -396,13 +414,20 @@ def run_batch(
     inventory: EndpointInventory,
     db: TaskStateDB,
     batch_id: str,
-    ctx: BatchContext,
+    ctx: Any | None,
     *,
     snapshot_id: str | None = None,
+    resume_specs: list[EndpointSpec] | None = None,
+    context_sha256: str = "",
 ) -> dict[str, Any]:
-    """Execute one batch end-to-end and write its artifact set."""
+    """Execute one batch end-to-end and write its artifact set.
+
+    resume_specs 提供时(断点续跑)跳过 expand_batch,直接使用从封存
+    manifest+db 行精确回放的任务集;此时 ctx 可为 None(symbol_universe
+    仅用于整市场任务的符号二分,回放任务均为显式单码,传空安全)。
+    """
     snapshot_id = snapshot_id or time.strftime(f"p0_{batch_id}_%Y%m%d_%H%M%S", time.gmtime())
-    specs = expand_batch(inventory, batch_id, ctx)
+    specs = resume_specs if resume_specs is not None else expand_batch(inventory, batch_id, ctx)
     logger.info("批次 %s: %d 个任务, snapshot=%s", batch_id, len(specs), snapshot_id)
 
     pipeline = ArchivePipeline(
@@ -410,7 +435,7 @@ def run_batch(
         provider,
         db,
         snapshot_id=snapshot_id,
-        symbol_universe=ctx.universe,
+        symbol_universe=ctx.universe if ctx is not None else [],
     )
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     started = time.perf_counter()
@@ -418,7 +443,183 @@ def run_batch(
     elapsed = time.perf_counter() - started
 
     decision = write_batch_artifacts(
-        config, db, batch_id, snapshot_id, specs, result, started_at, elapsed
+        config, db, batch_id, snapshot_id, specs, result, started_at, elapsed,
+        context_sha256=context_sha256,
     )
     logger.info("批次 %s decision=%s", batch_id, decision["decision"])
     return decision
+
+
+def save_frozen_specs(
+    path: Path,
+    *,
+    batch_id: str,
+    snapshot_id: str,
+    provider_name: str,
+    context_record: dict[str, Any],
+    specs: list[EndpointSpec],
+) -> dict[str, Any]:
+    """物化并封存批次任务清单(2026-07-22 用户指令)。
+
+    启动前把 expand 结果连同 context 记录整体冻结;启动/恢复一律从本
+    文件回放,禁止按最新交易日重建(见 ORPHANED_CONTEXT_DRIFT 事件)。
+    manifest_sha256 覆盖排序后的全部 task_id,加载时逐条重算校验。
+    """
+    from .pipeline import task_id
+
+    entries = [
+        {"api_name": s.api_name, "params": dict(s.params_template), "fields": s.fields}
+        for s in specs
+    ]
+    ids = sorted(
+        task_id(provider_name, e["api_name"], e["params"], e["fields"], snapshot_id)
+        for e in entries
+    )
+    manifest_sha = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
+    payload = {
+        "schema_version": 1,
+        "batch": batch_id,
+        "snapshot_id": snapshot_id,
+        "provider": provider_name,
+        "context": context_record,
+        "context_sha256": context_record.get("context_sha256", ""),
+        "task_count": len(entries),
+        "manifest_sha256": manifest_sha,
+        "specs": entries,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    logger.info("冻结任务清单: %s (%d 任务, manifest sha=%s)", path, len(entries), manifest_sha[:16])
+    return payload
+
+
+def load_frozen_specs(path: Path, config: ArchiveConfig, inventory: EndpointInventory) -> tuple[str, list[EndpointSpec]]:
+    """从冻结任务清单回放(fail-closed): 校验 snapshot/provider/manifest SHA。"""
+    from .pipeline import task_id
+
+    if not path.exists():
+        raise FileNotFoundError(f"冻结任务清单不存在: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    snapshot_id = payload["snapshot_id"]
+    if payload.get("provider") != config.provider.name:
+        raise ValueError(
+            f"冻结清单 provider 不符: {payload.get('provider')} != {config.provider.name}"
+        )
+    entries = payload.get("specs", [])
+    ids = sorted(
+        task_id(config.provider.name, e["api_name"], e["params"], e["fields"], snapshot_id)
+        for e in entries
+    )
+    manifest_sha = hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
+    if manifest_sha != payload.get("manifest_sha256"):
+        raise ValueError(
+            f"冻结清单 manifest SHA 不符(疑似篡改): 文件={str(payload.get('manifest_sha256'))[:12]} 重算={manifest_sha[:12]}"
+        )
+    specs: list[EndpointSpec] = []
+    for e in entries:
+        ep = inventory.endpoints[e["api_name"]]
+        spec = ep.to_spec()
+        spec.params_template = dict(e["params"])
+        if spec.fields != e["fields"]:
+            raise ValueError(f"冻结清单 fields 与注册表漂移: {e['api_name']}")
+        specs.append(spec)
+    logger.info("冻结清单回放: %d 任务, snapshot=%s", len(specs), snapshot_id)
+    return snapshot_id, specs
+
+
+def load_resume_specs(
+    config: ArchiveConfig,
+    db: TaskStateDB,
+    inventory: EndpointInventory,
+    batch_id: str,
+    snapshot_id: str,
+) -> list[EndpointSpec]:
+    """断点续跑的 fail-closed 任务回放(2026-07-22 用户指令)。
+
+    必须加载已物化的 manifest 与封存的 context 并校验 SHA;
+    任务参数逐行取自数据库(manifest task_id 精确匹配),禁止调用
+    build_context、禁止按最新交易日重建——context 漂移会产生不属于
+    原 manifest 的孤儿任务(参见 ORPHANED_CONTEXT_DRIFT 事件)。
+    任何校验失败直接抛异常(fail-closed),不降级。
+    """
+    reports_dir = config.reports_dir / BATCH_ARTIFACT_DIR / batch_id
+    manifest_path = reports_dir / "batch_manifest.jsonl"
+    if not manifest_path.exists():
+        # 已物化 manifest 缺失时,回退到启动前冻结的任务清单(同样 fail-closed,
+        # 内部校验 provider/manifest SHA);两者皆无则拒绝运行。
+        frozen_path = reports_dir / f"frozen_specs_{snapshot_id}.json"
+        if frozen_path.exists():
+            frozen_snapshot, specs = load_frozen_specs(frozen_path, config, inventory)
+            if frozen_snapshot != snapshot_id:
+                raise ValueError(
+                    f"断点续跑失败: 冻结清单 snapshot {frozen_snapshot} 与请求 {snapshot_id} 不符"
+                )
+            return specs
+        raise FileNotFoundError(
+            f"断点续跑失败: 已物化 manifest 不存在 {manifest_path} 且无冻结清单;"
+            f"禁止根据最新交易日重建,请检查批次 {batch_id} 是否曾正常收官"
+        )
+    manifest_lines = [
+        json.loads(line)
+        for line in manifest_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    matching = [m for m in manifest_lines if m.get("snapshot_id") == snapshot_id]
+    if not matching:
+        raise ValueError(
+            f"断点续跑失败: manifest 中没有 snapshot {snapshot_id} 的记录"
+        )
+    manifest = matching[0]  # 首条为原始物化 manifest
+    manifest_ids = [t["task_id"] for t in manifest["tasks"]]
+
+    # 封存 context 校验: manifest 记录的 SHA 优先;老 manifest 无该字段时,
+    # 仅当 context 文件唯一才可信,否则 fail-closed(可能存在漂移 context)。
+    expected_sha = manifest.get("context_sha256") or ""
+    context_files = sorted(reports_dir.glob("context_*.json"))
+    if expected_sha:
+        context_path = reports_dir / f"context_{expected_sha[:12]}.json"
+        if not context_path.exists():
+            raise FileNotFoundError(
+                f"断点续跑失败: 封存 context 文件缺失 {context_path}"
+            )
+        actual = json.loads(context_path.read_text(encoding="utf-8")).get("context_sha256", "")
+        if actual != expected_sha:
+            raise ValueError(
+                f"断点续跑失败: context SHA 不符 manifest={expected_sha[:12]} 文件={actual[:12]}"
+            )
+    elif len(context_files) == 1:
+        expected_sha = json.loads(context_files[0].read_text(encoding="utf-8")).get("context_sha256", "")
+    else:
+        raise ValueError(
+            f"断点续跑失败: manifest 未记录 context_sha256 且存在 "
+            f"{len(context_files)} 个 context 文件,无法确定封存版本"
+        )
+
+    rows = {t.task_id: t for t in db.list_tasks()}
+    missing = [tid for tid in manifest_ids if tid not in rows]
+    if missing:
+        raise ValueError(
+            f"断点续跑失败: {len(missing)} 个 manifest 任务在数据库中无记录(首: {missing[0][:12]})"
+        )
+    from .pipeline import task_id
+
+    specs: list[EndpointSpec] = []
+    for tid in manifest_ids:
+        row = rows[tid]
+        ep = inventory.endpoints[row.api_name]
+        spec = ep.to_spec()
+        if spec.fields != row.fields:
+            raise ValueError(
+                f"断点续跑失败: 任务 {tid[:12]} fields 漂移 registry={spec.fields!r} db={row.fields!r}"
+            )
+        recomputed = task_id(config.provider.name, row.api_name, dict(row.params), row.fields, snapshot_id)
+        if recomputed != tid:
+            raise ValueError(
+                f"断点续跑失败: 任务 {tid[:12]} 参数与 task_id 不一致(疑似参数被篡改)"
+            )
+        spec.params_template = dict(row.params)
+        specs.append(spec)
+    logger.info(
+        "断点续跑: 回放 manifest %d 任务, 封存 context=%s…", len(specs), expected_sha[:12]
+    )
+    return specs

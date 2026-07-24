@@ -21,6 +21,35 @@ class TaskStatus(str, Enum):
     INVALID_PARAMS = "invalid_params"
     SUSPECT_TRUNCATED = "suspect_truncated"
     QUARANTINED = "quarantined"
+    # 父任务触发行数上限后被拆分为不重叠子任务,且全部子任务已终态解决;
+    # 父任务自身不落盘(数据由子任务承载),属于已解决的终态。
+    BISECTED = "bisected"
+    # 所属 snapshot 在正式启动前被中止(2026-07-21 用户指令):
+    # 非终态行被受控迁移到本状态,任务与已落盘文件保留不删,
+    # 该 snapshot 永不续跑,后续批次使用新 snapshot(新 task_id)。
+    ABORTED_PRESTART = "aborted_prestart"
+    # 任务的参数拆分方式被证明与网关能力不匹配(2026-07-22 B3 repair):
+    # 该任务永不可取到数据,由替代拆分方式的新任务集承载数据
+    # (supersedes 映射与替代 manifest SHA 记录于 metadata/审计文件),
+    # 绝不标 success,属于已解决的终态。首个用例: fina_audit 年段拆分。
+    SUPERSEDED_INVALID_PARTITION = "superseded_invalid_partition"
+    # context 漂移孤儿任务(2026-07-22 用户指令): 断点续跑错误地用新交易日
+    # 重建 context,导致 params(如 end_date)漂移、task_id 重算,产生不属于
+    # 原 manifest 的任务。此类任务的数据库记录与 Raw/Bronze 文件保留不删、
+    # 不覆盖,但 research_eligible=false,且从 manifest/decision/fixtures/
+    # 研究选择器中排除(它们不在原 manifest 的 task_id 集合内,天然排除)。
+    ORPHANED_CONTEXT_DRIFT = "orphaned_context_drift"
+    # 响应恰满真实行上限被静默截断的任务(2026-07-23 B4 repair 用户指令):
+    # 该任务的数据可能不完整,由不重叠日期窗口递归二分的任务集承载数据
+    # (supersedes 映射与 repair manifest SHA 记录于 metadata/审计文件),
+    # 绝不标 success,属于已解决的终态。首个用例: share_float 真实 cap 6000。
+    SUPERSEDED_TRUNCATED_CAP = "superseded_truncated_cap"
+    # 2026-07-19 index_weight 撞名事件遗留的僵尸 running 任务(2026-07-23
+    # 用户指令): 旧宇宙/旧交易日生成的 2026 年段任务在 universe 重建后从未被
+    # 重跑,永远停在 running。其日期范围已被新一代同名指数、同区间(或覆盖
+    # 区间)的任务完全承载,经审计迁移到本状态,research_eligible=false,
+    # 绝不标 success,属于已解决的终态;原状态与后继映射保留在迁移 JSONL。
+    SUPERSEDED_LEGACY_COLLISION = "superseded_legacy_collision"
 
 
 @dataclass

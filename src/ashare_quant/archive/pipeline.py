@@ -19,6 +19,26 @@ from .throttle import RateLimitedClient, RetryPolicy, TokenBucket
 
 logger = logging.getLogger(__name__)
 
+# E 类网关缺字段缺陷白名单(2026-07-23 用户批准,图片方案第 1 条):
+# 仅这些端点的这些"缺字段"畸形 schema 指纹允许触发一次显式 fields 回退;
+# 映射: api_name -> {畸形指纹: 目标登记指纹}。未知 schema、新增列或
+# 类型变化一律不得自动回退(继续走 quarantine)。
+# 证据: suspend_d@20260708 三次复现缺 trade_date 畸形 3 列;index_weight
+# 2023 全年查询 fields 畸形为 ['con_code'];两者显式 fields 均返回正常。
+_EXPLICIT_FIELDS_FALLBACK_WHITELIST: dict[str, dict[str, str]] = {
+    "suspend_d": {
+        "5bc4181a8f6917aab3fb2722617df52665e0ddd75eb8ed5c40fe3fff42b86a6a":
+        "b10eeb0e0474db9a146be4ea05bdd994bf0224ffe30e7c1b0d0644217fb1ad3d",
+    },
+    "index_weight": {
+        "daf9cabce144f5dd4b594a7d9fb29555153a4ed08154147426546c7009b425bc":
+        "c16a626db6661bf2425030cf67d7cab5e24fd1ee56a032469f37d2f9ade08559",
+    },
+}
+
+# 回退尝试审计(原请求/缺字段响应/显式 fields 请求/两次响应 SHA/最终选择)
+_FALLBACK_AUDIT_JSONL = "explicit_fields_fallback_audit.jsonl"
+
 
 @dataclass
 class EndpointSpec:
@@ -31,6 +51,9 @@ class EndpointSpec:
     all_fields: bool
     fields: str
     params_template: dict[str, Any] = field(default_factory=dict)
+    # 网关单次响应行数硬上限(如 index_weight=7000)。响应行数达到上限即
+    # 判定疑似截断并按不重叠日期区间递归拆分。None 表示未登记,不启用检测。
+    row_cap: int | None = None
 
 
 @dataclass
@@ -101,7 +124,13 @@ class ArchivePipeline:
         for spec in specs:
             try:
                 task = self._get_or_create_task(spec)
-                if skip_existing and task.status in (TaskStatus.SUCCESS, TaskStatus.CONFIRMED_EMPTY):
+                # BISECTED 是已解决终态(数据由子任务承载),续跑时同样跳过,
+                # 否则父任务会被无意义地重放一遍截断→二分全流程。
+                if skip_existing and task.status in (
+                    TaskStatus.SUCCESS,
+                    TaskStatus.CONFIRMED_EMPTY,
+                    TaskStatus.BISECTED,
+                ):
                     logger.info("跳过已完成任务: %s", task.task_id)
                     result.tasks_completed += 1
                     continue
@@ -197,8 +226,10 @@ class ArchivePipeline:
             result.tasks_empty += 1
             return
 
-        # Truncation detection.
+        # Truncation detection: 运行时探测值优先,其次规格登记的硬上限。
         cap = self._observed_row_cap(spec.api_name)
+        if cap is None:
+            cap = spec.row_cap
         if self._is_suspect_truncated(response, spec, cap):
             task.status = TaskStatus.SUSPECT_TRUNCATED
             task.last_error = (
@@ -215,6 +246,29 @@ class ArchivePipeline:
             result.tasks_empty += sub_result.tasks_empty
             result.rows_total += sub_result.rows_total
             result.errors.extend(sub_result.errors)
+            # 全部子任务终态解决(success/confirmed_empty/自身亦被二分)时,
+            # 父任务转为 BISECTED 终态——数据由子任务承载,父任务不落盘。
+            child_ids = [
+                task_id(
+                    self.config.provider.name,
+                    s.api_name,
+                    dict(s.params_template),
+                    s.fields,
+                    self.snapshot_id,
+                )
+                for s in sub_specs
+            ]
+            children = [self.db.get(cid) for cid in child_ids]
+            resolved = (
+                TaskStatus.SUCCESS,
+                TaskStatus.CONFIRMED_EMPTY,
+                TaskStatus.BISECTED,
+            )
+            if children and all(c is not None and c.status in resolved for c in children):
+                task.status = TaskStatus.BISECTED
+                task.last_error = ""
+                task.metadata["bisected_into"] = child_ids
+                self.db.upsert(task)
             return
 
         # Schema drift guard: refuse to persist when the column layout matches
@@ -224,21 +278,30 @@ class ArchivePipeline:
         fingerprint = schema_fingerprint(response.columns)
         known_fingerprints = self.schema_registry.fingerprints(spec.api_name)
         if known_fingerprints and fingerprint not in known_fingerprints:
-            registered_hint = sorted(known_fingerprints)[-1]
-            task.status = TaskStatus.QUARANTINED
-            task.last_error = (
-                f"schema 漂移阻断: 已登记 {len(known_fingerprints)} 个指纹均不匹配 "
-                f"(最近 {registered_hint[:12]} != 本次 {fingerprint[:12]})"
-            )
-            task.metadata["schema_drift"] = {
-                "registered": registered_hint,
-                "observed": fingerprint,
-                "columns": list(response.columns),
-            }
-            self.db.upsert(task)
-            result.tasks_failed += 1
-            result.errors.append(f"{spec.api_name} {task.last_error}")
-            return
+            # 白名单 E 类缺字段缺陷: 显式 fields 最多回退一次(2026-07-23 用户批准)。
+            # 仅当 ①端点在白名单 ②畸形指纹已登记 ③响应列为登记 schema 的
+            # 严格子集 才触发;回退响应必须通过列名/主键/必需字段校验才接受。
+            fallback = self._try_explicit_fields_fallback(
+                spec, task, response, fingerprint, known_fingerprints)
+            if fallback is not None:
+                response = fallback
+                fingerprint = schema_fingerprint(response.columns)
+            else:
+                registered_hint = sorted(known_fingerprints)[-1]
+                task.status = TaskStatus.QUARANTINED
+                task.last_error = (
+                    f"schema 漂移阻断: 已登记 {len(known_fingerprints)} 个指纹均不匹配 "
+                    f"(最近 {registered_hint[:12]} != 本次 {fingerprint[:12]})"
+                )
+                task.metadata["schema_drift"] = {
+                    "registered": registered_hint,
+                    "observed": fingerprint,
+                    "columns": list(response.columns),
+                }
+                self.db.upsert(task)
+                result.tasks_failed += 1
+                result.errors.append(f"{spec.api_name} {task.last_error}")
+                return
 
         # Persist raw + bronze.
         partition_key = self._partition_key(spec, task.params)
@@ -284,6 +347,82 @@ class ArchivePipeline:
     def _observed_row_cap(self, api_name: str) -> int | None:
         if api_name in self.observed_caps:
             return self.observed_caps[api_name]
+        return None
+
+    def _try_explicit_fields_fallback(
+        self,
+        spec: EndpointSpec,
+        task: DownloadTask,
+        drift_response: ArchiveResponse,
+        drift_fingerprint: str,
+        known_fingerprints: set[str],
+    ) -> ArchiveResponse | None:
+        """白名单 E 类缺字段缺陷的显式 fields 回退(最多一次)。
+
+        触发条件(全部满足,否则返回 None 走 quarantine):
+          ① 端点在白名单且畸形指纹已登记为 E 类缺陷;
+          ② 目标登记指纹在 known_fingerprints 中;
+          ③ 响应列为登记 schema 列的严格子集(缺字段,而非未知/新增列)。
+        接受条件(全部满足,否则返回 None 走 quarantine):
+          回退响应成功、列指纹精确等于目标登记指纹(列名/必需字段/主键
+          随指纹一致性同时通过校验)。
+        无论接受与否,attempt 审计(原请求、缺字段响应 SHA、显式 fields
+        请求、回退响应 SHA、最终选择)写入 task.metadata 与审计 JSONL;
+        缺字段原始响应保存到 quarantine_evidence/,绝不覆盖已有 Raw。
+        """
+        mapping = _EXPLICIT_FIELDS_FALLBACK_WHITELIST.get(spec.api_name, {})
+        target_fp = mapping.get(drift_fingerprint)
+        if target_fp is None or target_fp not in known_fingerprints:
+            return None
+        registered = self.schema_registry.load(spec.api_name, target_fp)
+        registered_cols = list((registered or {}).get("columns", []))
+        if not registered_cols:
+            return None
+        if not set(drift_response.columns) < set(registered_cols):
+            return None  # 非严格子集: 未知/新增列,禁止回退
+
+        explicit_fields = ",".join(registered_cols)
+        retry = self.provider.request(spec.api_name, dict(task.params), fields=explicit_fields)
+        accepted = (
+            retry.is_success
+            and retry.row_count > 0
+            and schema_fingerprint(retry.columns) == target_fp
+        )
+        audit = {
+            "task_id": task.task_id,
+            "api_name": spec.api_name,
+            "original_params": dict(task.params),
+            "drift_fingerprint": drift_fingerprint,
+            "drift_columns": list(drift_response.columns),
+            "drift_response_sha256": drift_response.raw_payload_sha256,
+            "explicit_fields": explicit_fields,
+            "retry_fingerprint": schema_fingerprint(retry.columns) if retry.columns else "",
+            "retry_response_sha256": retry.raw_payload_sha256,
+            "retry_rows": retry.row_count,
+            "accepted": accepted,
+            "at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        task.metadata["explicit_fields_fallback"] = audit
+        # 缺字段原始响应存档(不覆盖任何已有 Raw;目录独立于 raw/bronze)
+        evidence_dir = self.config.catalog_dir / "quarantine_evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / f"{task.task_id}_drift.json").write_bytes(
+            drift_response.raw_payload
+            if isinstance(drift_response.raw_payload, bytes)
+            else str(drift_response.raw_payload).encode()
+        )
+        migrations_dir = self.config.catalog_dir / "migrations"
+        migrations_dir.mkdir(parents=True, exist_ok=True)
+        with open(migrations_dir / _FALLBACK_AUDIT_JSONL, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(audit, ensure_ascii=False) + "\n")
+        if accepted:
+            logger.info(
+                "E 类缺字段回退成功: %s %s 显式 fields 响应 %d 行,指纹匹配登记 %s",
+                spec.api_name, task.params, retry.row_count, target_fp[:12])
+            return retry
+        logger.warning(
+            "E 类缺字段回退未通过校验,保持 quarantine: %s %s",
+            spec.api_name, task.params)
         return None
 
     def _is_suspect_truncated(
@@ -374,12 +513,18 @@ class ArchivePipeline:
         if start_date and end_date and spec.primary_split:
             mid = self._bisect_date(start_date, end_date)
             if mid and mid != end_date:
+                # 不重叠区间: 左 [start, mid-1], 右 [mid, end]。
+                from datetime import datetime, timedelta
+
+                left_end = (
+                    datetime.strptime(mid, "%Y%m%d") - timedelta(days=1)
+                ).strftime("%Y%m%d")
                 left = dict(params)
                 right = dict(params)
                 # Update date range and keep the split key only if it is the
                 # actual date parameter used by the endpoint.
                 left["start_date"] = start_date
-                left["end_date"] = mid
+                left["end_date"] = left_end
                 right["start_date"] = mid
                 right["end_date"] = end_date
                 for d in (left, right):
@@ -444,6 +589,7 @@ class ArchivePipeline:
             all_fields=spec.all_fields,
             fields=spec.fields,
             params_template=params,
+            row_cap=spec.row_cap,
         )
 
     def probe_row_cap(self, api_name: str, params: dict[str, Any], fields: str) -> int:

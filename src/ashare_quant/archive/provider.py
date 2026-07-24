@@ -39,6 +39,8 @@ class ArchiveResponse:
     source_provider: str = ""
     source_endpoint: str = ""
     source_request_id: str = ""
+    # HTTP 429 时网关 Retry-After 头(秒),供调用方退避;无该头为 None。
+    retry_after_seconds: float | None = None
 
     @property
     def row_count(self) -> int:
@@ -99,6 +101,10 @@ def _request_id(api_name: str, params: dict[str, Any], fields: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
+class TotalDeadlineExceeded(Exception):
+    """单请求累计耗时超过硬性总响应期限(服务端挂起/慢滴字节)。"""
+
+
 class TushareCompatibleHttpProvider(ArchiveProvider):
     """Direct HTTP adapter for Tushare-compatible gateways.
 
@@ -117,6 +123,7 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
         allowed_hosts: list[str] | None = None,
         connect_timeout: float = 10.0,
         read_timeout: float = 120.0,
+        total_deadline_seconds: float = 180.0,
         accept_encoding: str = "gzip",
         follow_cross_host_redirects: bool = False,
         api_key_env: str | None = None,
@@ -130,6 +137,10 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
         self.allowed_hosts = set(allowed_hosts or [])
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
+        # 单请求硬性总响应期限(2026-07-21 用户指令): 服务端持续滴字节会让
+        # read timeout 永不触发;此处按请求起点累计计时,到期主动中断。
+        # 仅覆盖连接+响应接收;调用方的 Retry-After/退避等待不计入。
+        self.total_deadline_seconds = total_deadline_seconds
         self.accept_encoding = accept_encoding
         self.follow_cross_host_redirects = follow_cross_host_redirects
         self.api_key_env = api_key_env
@@ -239,6 +250,7 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
         payload_json = json.dumps(payload, ensure_ascii=False)
         request_id = _request_id(api_name, params, fields)
         start = time.perf_counter()
+        deadline_ts = time.monotonic() + self.total_deadline_seconds
         fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         logger.debug(
@@ -255,6 +267,7 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
                 data=payload_json.encode("utf-8"),
                 timeout=(self.connect_timeout, self.read_timeout),
                 allow_redirects=False,
+                stream=True,
             )
             elapsed = time.perf_counter() - start
         except requests.Timeout as exc:
@@ -309,6 +322,7 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
                     location,
                     timeout=(self.connect_timeout, self.read_timeout),
                     allow_redirects=False,
+                    stream=True,
                 )
             except requests.RequestException as exc:
                 elapsed = time.perf_counter() - start
@@ -325,7 +339,22 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
                     request_id=request_id,
                 )
 
-        raw = response.content
+        try:
+            raw = self._read_body_with_deadline(response, deadline_ts)
+        except TotalDeadlineExceeded:
+            elapsed = time.perf_counter() - start
+            return self._error_response(
+                api_name,
+                params,
+                fields,
+                "transient_error",
+                f"总响应期限超时({self.total_deadline_seconds:g}s): 服务端挂起或慢滴字节,已主动中断",
+                fetched_at,
+                elapsed,
+                b"",
+                http_status=response.status_code,
+                request_id=request_id,
+            )
         elapsed = time.perf_counter() - start
         raw_sha256 = hashlib.sha256(raw).hexdigest()
 
@@ -344,6 +373,13 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
             )
 
         if response.status_code == 429:
+            retry_after: float | None = None
+            raw_ra = response.headers.get("Retry-After")
+            if raw_ra:
+                try:
+                    retry_after = max(0.0, float(raw_ra))
+                except ValueError:
+                    retry_after = None  # HTTP-date 形式暂不解析,退回指数退避
             return self._error_response(
                 api_name,
                 params,
@@ -355,6 +391,7 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
                 raw,
                 http_status=response.status_code,
                 request_id=request_id,
+                retry_after_seconds=retry_after,
             )
 
         if response.status_code >= 500:
@@ -386,8 +423,10 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
             )
 
         try:
-            data = response.json()
-        except json.JSONDecodeError as exc:
+            # 用已按总期限完整接收的 raw 解析(stream=True 下 response.json()
+            # 会重复消费流);不完整响应不会到达这里(期限中断在上面已返回)。
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             return self._error_response(
                 api_name,
                 params,
@@ -467,6 +506,38 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
             source_request_id=request_id,
         )
 
+    def _read_body_with_deadline(self, response: Any, deadline_ts: float) -> bytes:
+        """分块读取响应体,累计超过总期限即关闭连接并抛 TotalDeadlineExceeded。
+
+        read timeout 是"两次字节到达间隔"上限,服务端持续慢滴字节时永不
+        触发;这里按请求起点的 monotonic 期限累计计时,每个分块到达后检查。
+        临时/不完整字节只在内存中,绝不发布到 Raw/Bronze。
+        """
+        iter_content = getattr(response, "iter_content", None)
+        if iter_content is None:
+            # 测试替身等无流式接口的响应: 一次性读出后检查期限。
+            body = response.content
+            if time.monotonic() > deadline_ts:
+                raise TotalDeadlineExceeded
+            return body
+        chunks: list[bytes] = []
+        try:
+            for chunk in iter_content(chunk_size=65536):
+                chunks.append(chunk)
+                if time.monotonic() > deadline_ts:
+                    raise TotalDeadlineExceeded
+        except TotalDeadlineExceeded:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            raise
+        if time.monotonic() > deadline_ts:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+            raise TotalDeadlineExceeded
+        return b"".join(chunks)
+
     def _error_response(
         self,
         api_name: str,
@@ -479,6 +550,7 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
         raw_payload: bytes,
         http_status: int | None,
         request_id: str,
+        retry_after_seconds: float | None = None,
     ) -> ArchiveResponse:
         logger.warning(
             "Provider error %s %s: %s (http=%s, request_id=%s)",
@@ -504,6 +576,7 @@ class TushareCompatibleHttpProvider(ArchiveProvider):
             source_provider=self.source_provider,
             source_endpoint=self._base_url,
             source_request_id=request_id,
+            retry_after_seconds=retry_after_seconds,
         )
 
 

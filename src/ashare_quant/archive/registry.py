@@ -23,6 +23,7 @@ class InventoryEndpoint:
     fields: str = ""
     params: dict[str, Any] | None = None
     enabled: bool = True
+    row_cap: int | None = None         # 网关单次响应行数硬上限(达到即疑似截断并拆分)
     # --- archival metadata ---
     batch: str = ""                      # B0_reference / B1_market / ... / P1 batches
     split_unit: str = "snapshot"         # snapshot|trade_date|month|quarter|year|symbol|symbol_year|symbol_quarter|index_year|index_month
@@ -44,6 +45,7 @@ class InventoryEndpoint:
             all_fields=self.all_fields,
             fields=self.fields or "",
             params_template=dict(self.params or {}),
+            row_cap=self.row_cap,
         )
 
 
@@ -70,6 +72,7 @@ class EndpointInventory:
                     fields=item.get("fields", ""),
                     params=item.get("params"),
                     enabled=bool(item.get("enabled", True)),
+                    row_cap=item.get("row_cap"),
                     batch=item.get("batch", ""),
                     split_unit=item.get("split_unit", "snapshot"),
                     required_params=item.get("required_params", []),
@@ -242,8 +245,15 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
     },
     {
         "api_name": "index_weight", "priority": "P0", "dataset": "index_membership",
-        "primary_key": ["index_code", "trade_date", "con_code"], "primary_split": "trade_date", "fallback_split": None,
+        "primary_key": ["index_code", "trade_date", "con_code"], "primary_split": "trade_date", "fallback_split": "index_code",
         "batch": "B2_universe", "split_unit": "index_year_main",
+        # 不要在此显式 fields: 实测(2026-07-20)显式 fields 会让网关只返回
+        # 月末权重、丢掉月中临时调样快照;fields="" 才能拿到全粒度。
+        # 畸形 schema(仅 con_code 一列)只出现在大区间响应,靠 row_cap 二分
+        # 或月级小区间即可规避。
+        # 网关单次响应硬上限 7000 行(超限时静默保留尾部月份)。达到上限即
+        # 疑似截断,按不重叠日期区间递归拆分。
+        "row_cap": 7000,
         "required_params": [], "supported_splits": ["index_code", "trade_date", "start_date/end_date"],
         "earliest_date": "20111101", "pit_rule": "成分权重按 trade_date 有效，禁止当前成分回填历史",
         "probe_params": {"index_code": "399300.SZ", "start_date": "20250101", "end_date": "20250131"},
@@ -267,77 +277,106 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
     # ======================= P0 · 财务与 PIT (B3_financial) =======================
     {
         "api_name": "income_vip", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date", "report_type", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
+        # 2026-07-21 修订版本主键: 同一报告期的多版公告(修订/更正)必须共存,
+        # 版本字段全部入键;列存在性实测见 preflight/b3_columns.json
+        "primary_key": ["ts_code", "end_date", "ann_date", "f_ann_date", "report_type", "comp_type", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": ["period"], "supported_splits": ["period", "ts_code", "report_type"],
         "earliest_date": "19950331", "pit_rule": _FIN_PIT,
         "probe_params": {"period": "20240930"},
+        # 2026-07-21 实测: 600码x8年恰返回 9000 行(窗口不变性确认硬上限)
+        "row_cap": 9000,
     },
     {
         "api_name": "balancesheet_vip", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date", "report_type", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
+        # 2026-07-21 修订版本主键: 同一报告期的多版公告(修订/更正)必须共存,
+        # 版本字段全部入键;列存在性实测见 preflight/b3_columns.json
+        "primary_key": ["ts_code", "end_date", "ann_date", "f_ann_date", "report_type", "comp_type", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": ["period"], "supported_splits": ["period", "ts_code", "report_type"],
         "earliest_date": "19950331", "pit_rule": _FIN_PIT,
         "probe_params": {"period": "20240930"},
+        # 2026-07-21 实测: 600码x5年恰返回 7000 行(硬上限)
+        "row_cap": 7000,
     },
     {
         "api_name": "cashflow_vip", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date", "report_type", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
+        # 2026-07-21 修订版本主键: 同一报告期的多版公告(修订/更正)必须共存,
+        # 版本字段全部入键;列存在性实测见 preflight/b3_columns.json
+        "primary_key": ["ts_code", "end_date", "ann_date", "f_ann_date", "report_type", "comp_type", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": ["period"], "supported_splits": ["period", "ts_code", "report_type"],
         "earliest_date": "19950331", "pit_rule": _FIN_PIT,
         "probe_params": {"period": "20240930"},
+        # 上限未直接测得(600码x5年=6400 行,未触顶);取保守默认 7000 作安全网
+        "row_cap": 7000,
     },
     {
         "api_name": "fina_indicator_vip", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
+        "primary_key": ["ts_code", "end_date", "ann_date", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": ["period"], "supported_splits": ["period", "ts_code"],
         "earliest_date": "19950331", "pit_rule": _FIN_PIT,
         "probe_params": {"period": "20240930"},
+        # 2026-07-21 实测: 600码x8年恰返回 12000 行(窗口不变性确认硬上限)
+        "row_cap": 12000,
     },
     {
         "api_name": "forecast_vip", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date", "ann_date", "type"], "primary_split": "period", "fallback_split": "ts_code",
+        "primary_key": ["ts_code", "end_date", "ann_date", "type", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": ["period"], "supported_splits": ["period", "ts_code"],
         "earliest_date": "20081231", "pit_rule": "以首次公开时间为可见时间，修订另建版本",
         "probe_params": {"period": "20240930"},
+        # 多码查询被网关拒绝(5码即空),上限不可探;单股历史仅数十行,取保守默认
+        "row_cap": 7000,
     },
     {
         "api_name": "express_vip", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date", "ann_date"], "primary_split": "period", "fallback_split": "ts_code",
+        "primary_key": ["ts_code", "end_date", "ann_date", "update_flag"], "primary_split": "period", "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": ["period"], "supported_splits": ["period", "ts_code"],
         "earliest_date": "20120331", "pit_rule": "以首次公开时间为可见时间，修订另建版本",
         "probe_params": {"period": "20240930"},
+        # 多码查询被网关拒绝(5码即空),上限不可探;单股历史仅数行,取保守默认
+        "row_cap": 7000,
     },
     {
         "api_name": "fina_audit", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date"], "primary_split": "period", "fallback_split": "ts_code",
-        "batch": "B3_financial", "split_unit": "year",
+        "primary_key": ["ts_code", "end_date", "ann_date"], "primary_split": "period", "fallback_split": "ts_code",
+        # split_unit=symbol(2026-07-22 B3 repair): 年段/全市场查询被网关拒绝
+        # (HTTP 500,仅 ts_code 单码可用);单码全历史已验证(6 只 L/D 股,
+        # 最大 39 行,远低于 row_cap),证据 preflight/fina_audit_symbol_validation.json。
+        # 原 32 个年段任务标 superseded_invalid_partition,由 5,866 个 symbol 任务替代。
+        "batch": "B3_financial", "split_unit": "symbol",
         "required_params": [], "supported_splits": ["ts_code", "period"],
         "earliest_date": "19951231", "pit_rule": _FIN_PIT,
         "probe_params": {"ts_code": "000001.SZ", "period": "20231231"},
+        # 多码查询被网关拒绝(5码即空),上限不可探;单股历史仅数十行,取保守默认
+        "row_cap": 7000,
     },
     {
         "api_name": "fina_mainbz_vip", "priority": "P0", "dataset": "financial_pit",
-        "primary_key": ["ts_code", "end_date", "bz_item", "type"], "primary_split": None, "fallback_split": "ts_code",
+        # 实测 8 列无 "type" 字段(2026-07-21 preflight/b3_columns.json);
+        # bz_item+bz_code 联合区分主营构成条目
+        "primary_key": ["ts_code", "end_date", "bz_item", "bz_code"], "primary_split": None, "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": [], "supported_splits": ["ts_code", "period", "type"],
         "earliest_date": "20071231", "pit_rule": _FIN_PIT,
         "probe_params": {"ts_code": "000001.SZ"},
         "probe_note": "period+type 单季度恰好 10000 行（截断上限）；按 ts_code 取全历史（千行级）规避",
+        "row_cap": 10000,
     },
     {
         "api_name": "disclosure_date", "priority": "P0", "dataset": "financial_pit",
+        # 预约披露按 (ts_code,end_date) 一行,pre/actual/modify_date 为原地更新,无需入键
         "primary_key": ["ts_code", "end_date"], "primary_split": None, "fallback_split": "ts_code",
         "batch": "B3_financial", "split_unit": "symbol",
         "required_params": [], "supported_splits": ["ts_code", "period"],
         "earliest_date": "20101231", "pit_rule": "预约披露日，公告后可见",
         "probe_params": {"ts_code": "000001.SZ"},
         "probe_note": "period 单年恰好 6000 行（截断上限）；按 ts_code 取全部预约记录（百余行）规避",
+        "row_cap": 6000,
     },
     # 非 VIP 财务接口：用于 VIP 抽样交叉核验
     {
@@ -384,16 +423,27 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
         "required_params": [], "supported_splits": ["ann_date", "start_date/end_date", "ts_code"],
         "earliest_date": "20150101", "pit_rule": _EVENT_PIT,
         "probe_params": {"ann_date": "20240115"},
+        # row_cap=2000 实测(2026-07-22 preflight): 宽区间/年度/202402 月均恰好
+        # 2000 行截断;月拆后仅 202402 达上限,由管线自动二分兜底。
+        # 月度峰值扫描(139 个月): 202402=2000, 202404=1658, 202403=1589。
+        "row_cap": 2000,
         "probe_note": "年度/半年区间恰好 2000 行（截断上限）；按月窗口切分",
     },
     {
         "api_name": "share_float", "priority": "P1", "dataset": "corporate_events",
         "primary_key": ["ts_code", "float_date"], "primary_split": "float_date", "fallback_split": "ts_code",
-        "batch": "B4_events", "split_unit": "symbol_chunk",
+        # split_unit=symbol(2026-07-22 preflight 实测修正): 多码 chunk 静默返回
+        # 空(同 5 码单查合计 377 行,chunk 0 行),旧 probe_note 的分块结论有误。
+        "batch": "B4_events", "split_unit": "symbol",
         "required_params": [], "supported_splits": ["ts_code", "ann_date", "float_date"],
         "earliest_date": "20050101", "pit_rule": "解禁事件，公告后可见",
         "probe_params": {"ts_code": "000001.SZ"},
-        "probe_note": "支持逗号代码列表分块；日期区间查询 HTTP 500",
+        # row_cap=6000 实测(2026-07-23 B4 运行中发现,此前保守 7000 有误):
+        # 解禁明细为持有人粒度,528 只股票全历史恰好 6000 行截断;网关忽略
+        # ann_date 参数(单日子查询仍返 6000),start/end_date 窗口二分有效,
+        # 撞帽任务由 B4 repair 用不重叠日期窗口递归二分收复。
+        "row_cap": 6000,
+        "probe_note": "多码 chunk 静默空(2026-07-22 实测),必须单码;日期区间查询 HTTP 500",
     },
     {
         "api_name": "pledge_stat", "priority": "P1", "dataset": "corporate_events",
@@ -402,6 +452,8 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
         "required_params": [], "supported_splits": ["ts_code", "end_date"],
         "earliest_date": "20150101", "pit_rule": _EVENT_PIT,
         "probe_params": {"ts_code": "000001.SZ"},
+        # 单码全历史实测最大 1,108 行(600000.SH),上限不可达,取保守默认
+        "row_cap": 7000,
         "probe_note": "季度横截面覆盖不全（部分统计日为空）；按 ts_code 取全历史",
     },
     {
@@ -411,6 +463,8 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
         "required_params": ["ts_code"], "supported_splits": ["ts_code"],
         "earliest_date": "20150101", "pit_rule": _EVENT_PIT,
         "probe_params": {"ts_code": "000002.SZ"},
+        # 单码全历史实测最大 148 行(000002.SZ),上限不可达,取保守默认
+        "row_cap": 7000,
         "probe_note": "000001.SZ 无质押明细属真实空；逗号代码列表不支持",
     },
     {
@@ -420,6 +474,8 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
         "required_params": [], "supported_splits": ["ts_code", "end_date", "ann_date"],
         "earliest_date": "20160101", "pit_rule": _EVENT_PIT,
         "probe_params": {"ts_code": "000001.SZ"},
+        # 单码全历史实测最大 300 行(000004.SZ),上限不可达,取保守默认
+        "row_cap": 7000,
         "probe_note": "季度横截面恰好 5500 行（截断上限）；按 ts_code 取全历史",
     },
     {
@@ -429,16 +485,22 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
         "required_params": [], "supported_splits": ["ts_code", "ann_date"],
         "earliest_date": "20150101", "pit_rule": _EVENT_PIT,
         "probe_params": {"ts_code": "000001.SZ"},
+        # 单码全历史实测最大 141 行(000002.SZ),上限不可达,取保守默认
+        "row_cap": 7000,
         "probe_note": "按 ts_code 取全历史",
     },
     {
         "api_name": "top10_holders", "priority": "P1", "dataset": "corporate_events",
         "primary_key": ["ts_code", "end_date", "holder_name"], "primary_split": "end_date", "fallback_split": "ts_code",
-        "batch": "B4_events", "split_unit": "symbol_chunk",
+        # split_unit=symbol(2026-07-22 preflight 实测修正): 多码 chunk 静默截断
+        # 单码全历史(000001.SZ 单查 298 行,chunk 内同码仅 58 行)。
+        "batch": "B4_events", "split_unit": "symbol",
         "required_params": ["ts_code"], "supported_splits": ["ts_code", "period"],
         "earliest_date": "20150101", "pit_rule": _EVENT_PIT,
         "probe_params": {"ts_code": "000001.SZ", "period": "20240930"},
-        "probe_note": "period 横截面 HTTP 500；支持逗号代码列表分块",
+        # 单码全历史实测最大 298 行(000001.SZ),上限不可达,取保守默认
+        "row_cap": 7000,
+        "probe_note": "period 横截面 HTTP 500；多码 chunk 静默截断历史(2026-07-22 实测),必须单码",
     },
     {
         "api_name": "top10_floatholders", "priority": "P1", "dataset": "corporate_events",
@@ -447,6 +509,8 @@ DEFAULT_ENDPOINTS: list[dict[str, Any]] = [
         "required_params": ["ts_code"], "supported_splits": ["ts_code", "period"],
         "earliest_date": "20150101", "pit_rule": _EVENT_PIT,
         "probe_params": {"ts_code": "000001.SZ", "period": "20231231"},
+        # 单码全历史实测最大 831 行(000002.SZ),上限不可达,取保守默认
+        "row_cap": 7000,
         "probe_note": "proxy 对部分季度（如 2024Q2/Q3）覆盖不全，归档后需在覆盖率报告单独列出",
     },
     # ======================= P1 · 资金/杠杆/异常交易 =======================

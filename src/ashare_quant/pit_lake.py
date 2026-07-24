@@ -67,7 +67,22 @@ FUNDAMENTAL_ALIASES = {
     "cashflow": ("cashflow_vip", "cashflow"),
     "fina_indicator": ("fina_indicator_vip", "fina_indicator"),
 }
-TERMINAL_STATUSES = {"success", "confirmed_empty"}
+# 批次证据的"全终态"判定集合。P0 全量归档新增以下已解决终态(2026-07,见
+# archive/state.py):bisected(父任务已拆分、数据由子任务承载)、
+# superseded_*(数据由替代任务集承载)、orphaned_context_drift 与
+# aborted_prestart(受控保留,research_eligible=false)。
+# 研究排除不依赖本集合:数据选择一律要求 status=="success"(见
+# _select_strict_tasks / _select_fixture_tasks),上述状态天然不进研究数据。
+TERMINAL_STATUSES = {
+    "success",
+    "confirmed_empty",
+    "bisected",
+    "superseded_invalid_partition",
+    "superseded_truncated_cap",
+    "superseded_legacy_collision",
+    "orphaned_context_drift",
+    "aborted_prestart",
+}
 
 _CATALOG_COLUMNS = {
     "task_id",
@@ -79,6 +94,10 @@ _CATALOG_COLUMNS = {
     "schema_fingerprint",
     "raw_sha256",
 }
+
+# raw_path 用于"批次 checksums 封存后受控收复文件"的 Raw 绑定复核;
+# 老版本测试夹具库可能缺该列,缺失时回退路径自动 fail-closed。
+_CATALOG_OPTIONAL_COLUMNS = {"raw_path"}
 
 _STRING_FUNDAMENTAL_COLUMNS = {
     "symbol",
@@ -139,6 +158,7 @@ class ArchiveTaskRecord:
     bronze_path: str
     schema_fingerprint: str
     raw_sha256: str
+    raw_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -179,9 +199,12 @@ def _read_archive_tasks(path: Path) -> dict[str, ArchiveTaskRecord]:
         missing = _CATALOG_COLUMNS.difference(columns)
         if missing:
             raise ValueError(f"归档状态库缺少字段: {sorted(missing)}")
+        optional = sorted(_CATALOG_OPTIONAL_COLUMNS & columns)
         rows = connection.execute(
             "SELECT task_id, api_name, params_json, status, row_count, "
-            "bronze_path, schema_fingerprint, raw_sha256 FROM archive_tasks"
+            "bronze_path, schema_fingerprint, raw_sha256"
+            + (", " + ", ".join(optional) if optional else "")
+            + " FROM archive_tasks"
         ).fetchall()
     finally:
         connection.close()
@@ -204,6 +227,9 @@ def _read_archive_tasks(path: Path) -> dict[str, ArchiveTaskRecord]:
             bronze_path=str(row["bronze_path"] or ""),
             schema_fingerprint=str(row["schema_fingerprint"] or ""),
             raw_sha256=str(row["raw_sha256"] or ""),
+            raw_path=(
+                str(row["raw_path"] or "") if "raw_path" in row.keys() else ""
+            ),
         )
         result[record.task_id] = record
     return result
@@ -248,7 +274,59 @@ def _parse_checksums(path: Path) -> dict[str, str]:
     return checksums
 
 
-def _load_batch_evidence(reports_root: Path, batch: str) -> BatchEvidence:
+def _verify_seal_acceptance(
+    root: Path, batch: str, decision: dict[str, Any], manifest_path: Path
+) -> None:
+    """批次主决策非 pass 时,以同目录 SEAL 文件作为权威验收(如 B3 修复后封存)。
+
+    绑定链:SEAL 与主决策同一 snapshot;SEAL 记录的 manifest SHA 与当前文件一致;
+    repair_decision 文件 SHA 与 SEAL 记录一致且结论/闸门全 pass;
+    SEAL 终验 by_status 全部属于已解决终态(quarantined 天然不在 TERMINAL_STATUSES
+    中,未解释隔离在此 fail-closed)。
+    """
+    seal_path = root / f"SEAL_{batch.split('_', 1)[0]}.json"
+    if not seal_path.is_file():
+        raise ValueError(f"批次 {batch} 未通过全部准入门且无 SEAL 封存")
+    seal = _read_json(seal_path)
+    snapshot_id = str(decision.get("snapshot_id", ""))
+    if not snapshot_id or str(seal.get("snapshot_id", "")) != snapshot_id:
+        raise ValueError(f"批次 {batch} SEAL 与主决策 snapshot 不一致")
+    if str(seal.get("batch_manifest_sha256", "")) != sha256_file(manifest_path):
+        raise ValueError(f"批次 {batch} SEAL 与 manifest 指纹不一致")
+    if str(seal.get("repair_decision", "")) != "pass":
+        raise ValueError(f"批次 {batch} SEAL 修复决策非 pass")
+    expected = str(seal.get("repair_decision_sha256", ""))
+    matches = [
+        candidate
+        for candidate in sorted(root.parent.glob("*/repair_decision.json"))
+        if expected and sha256_file(candidate) == expected
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"批次 {batch} SEAL 修复决策文件指纹不匹配")
+    repair = _read_json(matches[0])
+    repair_gates = repair.get("gates", {})
+    if (
+        repair.get("decision") != "pass"
+        or str(repair.get("source_snapshot", "")) != snapshot_id
+        or not isinstance(repair_gates, dict)
+        or not repair_gates
+        or not all(value is True for value in repair_gates.values())
+    ):
+        raise ValueError(f"批次 {batch} 修复决策内容与 SEAL 不一致")
+    final = seal.get("final_verification", {})
+    final_by_status = final.get("by_status", {}) if isinstance(final, dict) else {}
+    if not final_by_status or any(
+        status not in TERMINAL_STATUSES for status in final_by_status
+    ):
+        raise ValueError(f"批次 {batch} SEAL 终验含非终态状态: {final_by_status}")
+
+
+def _load_batch_evidence(
+    reports_root: Path,
+    batch: str,
+    *,
+    catalog: Mapping[str, ArchiveTaskRecord] | None = None,
+) -> BatchEvidence:
     root = reports_root.resolve() / "batches" / batch
     decision_path = root / "batch_decision.json"
     manifest_path = root / "batch_manifest.jsonl"
@@ -258,14 +336,17 @@ def _load_batch_evidence(reports_root: Path, batch: str) -> BatchEvidence:
             raise FileNotFoundError(f"严格归档缺少批次证据: {path}")
     decision = _read_json(decision_path)
     gates = decision.get("gates", {})
-    if (
-        decision.get("batch") != batch
-        or decision.get("decision") != "pass"
-        or not isinstance(gates, dict)
-        or not gates
-        or not all(value is True for value in gates.values())
-    ):
-        raise ValueError(f"批次 {batch} 未通过全部准入门")
+    decision_ok = (
+        decision.get("batch") == batch
+        and decision.get("decision") == "pass"
+        and isinstance(gates, dict)
+        and gates
+        and all(value is True for value in gates.values())
+    )
+    if not decision_ok:
+        # 主决策为封存前历史结论(如 B3 主批次 fail 后经文脉内修复):
+        # 以 SEAL 权威验收链复核,任一环节不一致即 fail-closed。
+        _verify_seal_acceptance(root, batch, decision, manifest_path)
     snapshot_id = str(decision.get("snapshot_id", ""))
     if not snapshot_id:
         raise ValueError(f"批次 {batch} 缺少 snapshot_id")
@@ -293,8 +374,22 @@ def _load_batch_evidence(reports_root: Path, batch: str) -> BatchEvidence:
         by_status[status] = by_status.get(status, 0) + 1
     if by_status != manifest.get("by_status"):
         raise ValueError(f"批次 {batch} manifest 状态汇总不一致")
-    if any(status not in TERMINAL_STATUSES for status in by_status):
-        raise ValueError(f"批次 {batch} 仍含非终态任务: {by_status}")
+    if catalog is None:
+        current_by_status = by_status
+    else:
+        # 终态判定以状态库当前真值为准:封存 manifest 是追加式历史记录,
+        # 封存后发生的受控恢复(如 B1 suspend_d 隔离任务经显式 fields 回退
+        # 转为 success,2026-07-23)不会改写历史 manifest 行。quarantined
+        # 不属于 TERMINAL_STATUSES,真实未解决的隔离任务在此 fail-closed。
+        current_by_status = {}
+        for task in manifest_tasks:
+            task_id = str(task.get("task_id", ""))
+            record = catalog.get(task_id)
+            if record is None:
+                raise ValueError(f"批次 {batch} 任务不在状态库中: {task_id}")
+            current_by_status[record.status] = current_by_status.get(record.status, 0) + 1
+    if any(status not in TERMINAL_STATUSES for status in current_by_status):
+        raise ValueError(f"批次 {batch} 仍含非终态任务: {current_by_status}")
     return BatchEvidence(
         batch=batch,
         snapshot_id=snapshot_id,
@@ -335,14 +430,12 @@ def _select_strict_tasks(
             record = catalog.get(task_id)
             if record is None:
                 raise ValueError(f"批次任务不在状态库中: {api_name}/{task_id}")
-            manifest_status = str(row.get("status", ""))
-            if record.status != manifest_status:
-                raise ValueError(
-                    f"批次证据与当前状态库不一致: {task_id} "
-                    f"{manifest_status}!={record.status}"
-                )
             if record.api_name != api_name:
                 raise ValueError(f"任务端点身份不一致: {task_id}")
+            # 状态以状态库当前真值为准:封存 manifest 记录的是写入时刻的历史
+            # 状态,封存后受控恢复(quarantined→success)与审计迁移(orphaned/
+            # superseded)不会改写历史行;严格端点在真值下必须 success/empty,
+            # 其余状态(含 quarantined)在此 fail-closed。
             if record.status == "confirmed_empty":
                 continue
             if record.status != "success":
@@ -797,7 +890,7 @@ def build_pit_cache_from_archive(
         base_manifest_path: Path | None = None
     else:
         batches = {
-            batch: _load_batch_evidence(reports, batch)
+            batch: _load_batch_evidence(reports, batch, catalog=task_catalog)
             for batch in STRICT_BATCHES
         }
         selected, source_by_api = _select_strict_tasks(task_catalog, batches)
@@ -835,6 +928,7 @@ def build_pit_cache_from_archive(
     )
     schema_evidence: dict[tuple[str, str], dict[str, Any]] = {}
     lineage_tasks: dict[str, dict[str, Any]] = {}
+    checksum_fallback_tasks: list[str] = []
 
     def load(task: ArchiveTaskRecord) -> pd.DataFrame:
         expected_checksum: str | None = None
@@ -843,7 +937,17 @@ def build_pit_cache_from_archive(
             _, relative = remap_archive_path(task.bronze_path, root)
             expected_checksum = batches[batch].checksums.get(relative)
             if expected_checksum is None:
-                raise ValueError(f"批次 checksums 未封存 Bronze: {relative}")
+                # 批次 checksums 封存之后经受控修复收复的文件(如 B3 transient
+                # 原参数精确重放):以状态库登记的 raw_sha256 复核原始响应做绑定,
+                # Bronze 行数与 schema 指纹仍由 _load_partition fail-closed 校验。
+                raw_path, _ = remap_archive_path(task.raw_path, root)
+                if (
+                    not task.raw_sha256
+                    or not raw_path.is_file()
+                    or sha256_file(raw_path) != task.raw_sha256.lower()
+                ):
+                    raise ValueError(f"批次 checksums 未封存 Bronze: {relative}")
+                checksum_fallback_tasks.append(task.task_id)
         frame, relative, digest = _load_partition(
             task,
             root,
@@ -1035,6 +1139,7 @@ def build_pit_cache_from_archive(
             "requested_start": str(start.date()),
             "requested_end": str(end.date()),
             "symbols": symbols,
+            "checksum_fallback_tasks": sorted(checksum_fallback_tasks),
         }
         lineage_path = staging / ARCHIVE_LINEAGE_FILENAME
         _atomic_gzip_json(lineage, lineage_path)
