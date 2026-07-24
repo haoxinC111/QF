@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build the Phase A.1 + P0 delivery ZIP (v2.0.0a11).
+"""Build the Phase A.1 + P0 delivery ZIP (v2.0.0a12).
 
 Whitelist-based collection: source, tests, docs, config example, and the
 sanitized report set. The archive MUST NOT contain tokens, local config,
@@ -8,7 +8,7 @@ QF_ARCHIVE_API_TOKEN value and the string of the official TUSHARE_TOKEN
 environment variable before packing.
 
 Usage:
-    python scripts/build_delivery_zip.py --version 2.0.0a11
+    python scripts/build_delivery_zip.py --version 2.0.0a12
 """
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ def scan_for_secrets(files: list[Path]) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default="2.0.0a11")
+    parser.add_argument("--version", default="2.0.0a12")
     args = parser.parse_args()
 
     files = collect_files()

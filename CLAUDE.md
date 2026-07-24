@@ -63,6 +63,7 @@
   - `v2.0.0a7`：新增 PIT 固定候选的严格账本四臂影子归因、覆盖匹配控制、年度/成本治理和 Alpha2 封存前置门禁；生产策略不变
   - `v2.0.0a10`：新增 Bronze 归档到 PIT v1 的只读离线桥接、B0/B1/B3 批次门禁、Schema/行数/SHA256 复核、分桶流式转换和 fixture 禁研标志；生产策略不变
   - `v2.0.0a11`：新增 Alpha5 真实 PIT 一键验收、源证据重放、逐月历史覆盖、数据指纹绑定回执与 Alpha2/Alpha3 强制门禁；批次决策增加 `no_quarantined`，并修复 macOS 临时目录比较和 NumPy/Pandas 时间差弃用告警；生产策略不变
+  - `v2.0.0a12`：P0 全量归档交付验收集成：新增 archive→v4 基础行情缓存兼容层(`base_cache_bridge` + G1–G8 门禁构建器,确定性指纹、archive_provenance 全绑定)、pit_lake 状态库真值对账与 SEAL 验收、Raw 逐文件重校验;B0 截断修复(index_member_all/namechange)复验通过,G1–G8 全过,pit-acceptance strict pass 且 research_eligible=true;生产策略不变
 
 ## 3. ZIP 处理标准流程
 
